@@ -1,0 +1,108 @@
+{
+  "EGI_2_0_EMEA_INC": {
+    "input_file_extension": ".xlsx",
+    "file_pattern": "^EGI_2_0_EMEA_INC_\\d{8}\\.xlsx$",
+    "sheet_name": "Report 1",
+    "required_columns": [
+      "CP_Backlog_SNI_Revenue",
+      "CP_Route_To_Market",
+      "Segment_Level_2_Description",
+      "Customer_PO_Number",
+      "End_Customer_Party_Name",
+      "Sales_Order_Line_Item_Identifier",
+      "Delivery_Identifier",
+      "Material_Number",
+      "Financial_Close_Calendar_Year_Month_Code",
+      "Include_Exclude",
+      "Order_Create_Date",
+      "Order_Type",
+      "Profit_Center_Hierarchy_Level_3_Description",
+      "Profit_Center_Hierarchy_Level_4_Description",
+      "Profit_Center_Hierarchy_Level_7",
+      "Profit_Center_Hierarchy_Level_7_Description",
+      "Route_To_Market",
+      "Sales_Order_Completion_Status_Code",
+      "Sales_Order_Identifier",
+      "SC_Risk_Assessment_Category",
+      "Ship_To_Party_Name",
+      "Shipment_Actual_Goods_Movement_Date",
+      "Sold_To_Party_Name",
+      "Source_Type",
+      "Sum_of_Base_Quantity",
+      "Sum_of_Sales_Order_Base_Quantity",
+      "Sum_of_CP_Enterprise_Standard_Cost_(USD)",
+      "Sum_of_CP_Factory_Margin_(USD)",
+      "Sum_of_CP_Gross_Margin_(USD)",
+      "Sum_of_CP_Net_Revenue_(USD)",
+      "Sum_of_CP_Total_Cost_of_Sales_(USD)",
+      "Sum_of_CP_Unit_Quantity",
+      "Sum_of_Gross_Revenue_(USD)",
+      "Sum_of_Net_Revenue",
+      "Sum_of_Net_Revenue_(USD)",
+      "Sum_of_Order_Item_Net_Value_(USD)",
+      "Sum_of_Order_Item_Net_Value_Document_Currency",
+      "Process_Timestamp"
+    ],
+    "notnull_columns": [
+      "Order_Create_Date",
+      "Shipment_Actual_Goods_Movement_Date",
+      "Process_Timestamp"
+    ],
+    "date_columns": [
+      {
+        "Order_Create_Date": "yyyy-MM-dd",
+        "Shipment_Actual_Goods_Movement_Date": "yyyy-MM-dd",
+        "Process_Timestamp": "yyyy-MM-dd"
+      }
+    ],
+    "primary_key_columns": [
+      "r_revenue_egi_nrt_id"
+    ],
+    "hash_columns": [
+      "Order_Type",
+      "Order_Create_Date",
+      "Sales_Order_Identifier",
+      "Sales_Order_Line_Item_Number",
+      "Source_Type",
+      "Shipment_Actual_Goods_Movement_Date",
+      "Delivery_Identifier"
+    ],
+    "watermark_column": "Process_Timestamp",
+    "load_type": "incremental",
+    "incremental_load": {
+      "enabled": true,
+      "mode": "SCD2"
+    },
+    "dq_checks": {
+      "remove_invisible_spaces": true,
+      "trim_spaces": true,
+      "remove_special_characters": true,
+      "remove_alpha_from_numeric": true,
+      "row_duplicate_check": true,
+      "integer_format_check": true,
+      "null_notnull_check": true,
+      "date_format_check": true,
+      "timestamp_format_check": true,
+      "standardize_date_timestamp": true,
+      "replace_zeros_placeholders_with_null_in_date": true,
+      "cast_columns_to_integer_double": true,
+      "replace_nulls_with_defaults": false,
+      "decimal_column_normalization": true,
+      "reject_and_audit_logging": true,
+      "primary_key_uniqueness": true,
+      "watermark_validation": true,
+      "hash_validation": true,
+      "replay_detection": true
+    },
+    "Integer_cleanup_columns": [],
+    "cast_to_int_columns": [],
+    "column_cleanup_columns": [],
+    "drop_null_data_columns": [],
+    "edi_cleanup_columns": [],
+    "header_row_number_to_select": 0,
+    "remove_trailer_rows": 0,
+    "int_columns": [],
+    "string_columns": [],
+    "timestamp_columns": []
+  }
+}
