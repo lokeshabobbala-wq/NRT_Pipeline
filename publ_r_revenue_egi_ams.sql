@@ -1,0 +1,69 @@
+-- published.r_revenue_egi_ams definition
+
+-- Drop table
+
+-- DROP TABLE published.r_revenue_egi_ams;
+
+--DROP TABLE published.r_revenue_egi_ams;
+CREATE TABLE IF NOT EXISTS published.r_revenue_egi_ams
+(
+	r_revenue_egi_nrt_id BIGINT NOT NULL DEFAULT "identity"(14711510, 0, ('1,1'::character varying)::text) ENCODE az64
+	,fiscal_quarter VARCHAR(100)   ENCODE lzo
+	,eg_net_revenue NUMERIC(18,4)   ENCODE az64
+	,"region" VARCHAR(100)   ENCODE lzo
+	,region_id INTEGER   ENCODE az64
+	,sales_order_identifier VARCHAR(100)   ENCODE lzo
+	,sales_order_line_item_number VARCHAR(100)   ENCODE lzo
+	,sap_order_key VARCHAR(100)   ENCODE lzo
+	,order_create_calendar_date DATE   ENCODE az64
+	,shipment_date DATE   ENCODE az64
+	,eg_end_customer_name VARCHAR(500)   ENCODE lzo
+	,final_rtm VARCHAR(100)   ENCODE lzo
+	,secured_position_net_usd NUMERIC(18,4)   ENCODE az64
+	,sc_bklg_catg VARCHAR(100)   ENCODE lzo
+	,sku_description VARCHAR(500)   ENCODE lzo
+	,include_exclude VARCHAR(100)   ENCODE lzo
+	,business_area_code VARCHAR(100)   ENCODE lzo
+	,customer_po_number VARCHAR(500)   ENCODE lzo
+	,financial_close_calendar_year_month_code VARCHAR(500)   ENCODE lzo
+	,order_type VARCHAR(500)   ENCODE lzo
+	,profit_center_hierarchy_level_3_description VARCHAR(500)   ENCODE lzo
+	,profit_center_hierarchy_level_4_description VARCHAR(500)   ENCODE lzo
+	,route_to_market VARCHAR(500)   ENCODE lzo
+	,sales_order_completion_status_code VARCHAR(500)   ENCODE lzo
+	,material_number VARCHAR(500)   ENCODE lzo
+	,source_type VARCHAR(500)   ENCODE lzo
+	,sum_of_base_quantity NUMERIC(18,4)   ENCODE az64
+	,sum_of_cp_unit_quantity NUMERIC(18,4)   ENCODE az64
+	,"sum_of_cp_enterprise_standard_cost_(usd)" NUMERIC(18,4)   ENCODE az64
+	,"sum_of_cp_factory_margin_(usd)" NUMERIC(18,4)   ENCODE az64
+	,"sum_of_cp_gross_margin_(usd)" NUMERIC(18,4)   ENCODE az64
+	,"sum_of_cp_gross_revenue_(usd)" NUMERIC(18,4)   ENCODE az64
+	,"sum_of_cp_total_cost_of_sales_(usd)" NUMERIC(18,4)   ENCODE az64
+	,"sum_of_gross_revenue_(usd)" NUMERIC(18,4)   ENCODE az64
+	,sum_of_net_revenue NUMERIC(18,4)   ENCODE az64
+	,"sum_of_order_item_net_value_(usd)" NUMERIC(18,4)   ENCODE az64
+	,sold_to_customer_sta VARCHAR(500)   ENCODE lzo
+	,ship_to_customer_sta VARCHAR(500)   ENCODE lzo
+	,is_current_fg VARCHAR(100)   ENCODE lzo
+	,batch_run_dt DATE   ENCODE RAW
+	,source_nm VARCHAR(500)   ENCODE lzo
+	,created_by VARCHAR(500)   ENCODE lzo
+	,create_dt TIMESTAMP WITHOUT TIME ZONE  DEFAULT ('now'::character varying)::timestamp without time zone ENCODE az64
+	,last_update_dt TIMESTAMP WITHOUT TIME ZONE  DEFAULT ('now'::character varying)::timestamp without time zone ENCODE az64
+	,cp_backlog_sni_revenue VARCHAR(100)   ENCODE lzo
+	,delivery_identifier VARCHAR(100)   ENCODE lzo
+	,sum_of_sales_order_base_quantity NUMERIC(30,15)   ENCODE az64
+	,sum_of_order_item_net_value_document_currency NUMERIC(30,15)   ENCODE az64
+	,start_date DATE   ENCODE az64
+	,end_date DATE   ENCODE az64
+	,process_timestamp TIMESTAMP WITHOUT TIME ZONE   ENCODE az64
+	,PRIMARY KEY (r_revenue_egi_nrt_id)
+)
+DISTSTYLE KEY
+ DISTKEY (sap_order_key)
+ SORTKEY (
+	batch_run_dt
+	)
+;
+ALTER TABLE published.r_revenue_egi_ams owner to arubauser;
