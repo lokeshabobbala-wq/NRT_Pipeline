@@ -30,7 +30,7 @@ class NRTGlueJob:
             sys.argv,
             [
                 'S3_BUCKET', 'MAIN_KEY', 'METADATA_KEY', 'CONFIG_S3_PATH',
-                'CURATED_TABLE', 'PUBLISHED_TABLE', 'FULL_CONFIG',
+                'CURATED_TABLE', 'PUBLISHED_TABLE', 'FULL_CONFIG', 'BASE_FILE_NAME',
                 'database', 'env', 'resourcearn',
                 'schema', 'secretarn', 'sns_arn', 'KMS_ID'
             ]
@@ -43,10 +43,6 @@ class NRTGlueJob:
         bucket, key = config_s3_path.replace("s3://", "").split("/", 1)
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj['Body'].read())
-
-    # def _update_audit_log(self, status, error_message=""):
-    #     # Audit functionality temporarily disabled for testing.
-    #     pass
 
     def _send_notification(self, error_message):
         try:
@@ -63,8 +59,6 @@ class NRTGlueJob:
 
     def run(self):
         self.logger.info(f"Processing file: {self.args['MAIN_KEY']}")
-        # Only log the key arguments needed for processing
-        self.logger.info(f"Processing file: {self.args['MAIN_KEY']}")
         self.logger.info(f"Using curated table: {self.args['CURATED_TABLE']}")
         self.logger.info(f"Config S3 path: {self.args['CONFIG_S3_PATH']}")
         self.logger.info(f"Metadata file: {self.args['METADATA_KEY']}")
@@ -74,12 +68,13 @@ class NRTGlueJob:
         self.logger.info(json.dumps(self.full_config, indent=2))
         self.logger.info("--- CONFIG FILE FROM S3 (FOR FILE TYPE) ---")
         self.logger.info(json.dumps(self.config, indent=2))
-        # ...other key log lines...
-        entity_config = self.config["EGI_2_0_INC"]
+
+        entity_config = self.config[self.args['BASE_FILE_NAME']]
         allowed_prefixes = entity_config.get("allowed_prefixes", [""])
         expected_extension = entity_config.get("input_file_extension", "csv")
         rds_secret_name = self.args['secretarn']
         kms_id = self.args['KMS_ID']
+        excel_engine = entity_config.get("excel_engine", "openpyxl")  # Default to openpyxl if not set
 
         s3 = boto3.client('s3')
         landing_prefix = os.path.dirname(self.args['MAIN_KEY'])
@@ -102,22 +97,29 @@ class NRTGlueJob:
 
         try:
             self.logger.info("Starting file validation...")
-            valid = validator.validate_file(
+            valid, decrypted_bytes = validator.validate_file(
                 file_key, metadata_key, entity_config,
                 all_data_keys=all_data_keys, all_metadata_keys=all_metadata_keys
             )
             if valid:
                 self.logger.info("File validation PASSED.")
-                decrypted_bytes = validator.check_kms_encryption_and_decrypt(file_key)
-                # If small: load to DataFrame directly
+                # You can choose load with CSV/Excel based on input_file_extension
                 import pandas as pd
-                from io import BytesIO
-                pandas_df = pd.read_excel(BytesIO(decrypted_bytes),dtype=str, engine='openpyxl')  # or engine='xlrd' for .xls
+                from io import BytesIO, StringIO
+
+                if expected_extension.lower() == "csv":
+                    pandas_df = pd.read_csv(StringIO(decrypted_bytes.decode("utf-8")), dtype=str)
+                elif expected_extension.lower() in ("xlsx", "xls"):
+                    pandas_df = pd.read_excel(BytesIO(decrypted_bytes), dtype=str, engine=excel_engine)
+                else:
+                    raise Exception(f"Unsupported extension: {expected_extension}")
+
                 spark_df = self.spark.createDataFrame(pandas_df.astype(str).replace('nan', '').replace('NaT', ''))
+                # Do your Spark DQ checks here...
                 # self._update_audit_log(status="Succeeded")
             else:
                 self.logger.error("File validation FAILED.")
-                error_message = "File validation failed for {}. See log for details.".format(file_key)
+                error_message = f"File validation failed for {file_key}. See log for details."
                 # self._update_audit_log(status="Failed", error_message=error_message)
                 self._send_notification(error_message)
         except Exception as e:
