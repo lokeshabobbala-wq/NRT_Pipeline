@@ -9,13 +9,14 @@ from io import BytesIO
 
 from logging_util import Logging
 from file_validation import FileValidator
+from data_validation import DataValidator  # <-- Import the new class
 
 class NRTGlueJob:
     def __init__(self):
         self.args = self._parse_args()
         self.spark = SparkSession.builder.appName("DQ").config('spark.sql.codegen.wholeStage', 'false').getOrCreate()
         self.spark.conf.set("spark.sql.shuffle.partitions", 20)
-        self.spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+        self.spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
         self.logger = Logging(
             spark_context=self.spark,
             app_name="NRT_PIPELINE",
@@ -30,7 +31,7 @@ class NRTGlueJob:
             sys.argv,
             [
                 'S3_BUCKET', 'MAIN_KEY', 'METADATA_KEY', 'CONFIG_S3_PATH',
-                'CURATED_TABLE', 'PUBLISHED_TABLE', 'FULL_CONFIG', 'BASE_FILE_NAME',
+                'CURATED_TABLE', 'PUBLISHED_TABLE', 'FULL_CONFIG',
                 'database', 'env', 'resourcearn',
                 'schema', 'secretarn', 'sns_arn', 'KMS_ID'
             ]
@@ -69,12 +70,22 @@ class NRTGlueJob:
         self.logger.info("--- CONFIG FILE FROM S3 (FOR FILE TYPE) ---")
         self.logger.info(json.dumps(self.config, indent=2))
 
-        entity_config = self.config[self.args['BASE_FILE_NAME']]
+        # --- Load entity config ---
+        entity_name = os.path.splitext(os.path.basename(self.args['MAIN_KEY']))[0].split('_')[0]
+        # Use explicit key or fallback to known config section
+        entity_config_key = None
+        for k in self.config.keys():
+            if self.args['MAIN_KEY'].split('/')[-1].startswith(k):
+                entity_config_key = k
+                break
+        if not entity_config_key:
+            entity_config_key = list(self.config.keys())[0]  # fallback to first key
+
+        entity_config = self.config[entity_config_key]
         allowed_prefixes = entity_config.get("allowed_prefixes", [""])
         expected_extension = entity_config.get("input_file_extension", "csv")
         rds_secret_name = self.args['secretarn']
         kms_id = self.args['KMS_ID']
-        excel_engine = entity_config.get("excel_engine", "openpyxl")  # Default to openpyxl if not set
 
         s3 = boto3.client('s3')
         landing_prefix = os.path.dirname(self.args['MAIN_KEY'])
@@ -103,30 +114,58 @@ class NRTGlueJob:
             )
             if valid:
                 self.logger.info("File validation PASSED.")
-                # You can choose load with CSV/Excel based on input_file_extension
+                # Load file into pandas DataFrame
                 import pandas as pd
                 from io import BytesIO, StringIO
 
                 if expected_extension.lower() == "csv":
                     pandas_df = pd.read_csv(StringIO(decrypted_bytes.decode("utf-8")), dtype=str)
                 elif expected_extension.lower() in ("xlsx", "xls"):
-                    pandas_df = pd.read_excel(BytesIO(decrypted_bytes), dtype=str, engine=excel_engine)
+                    excel_engine = entity_config.get("excel_engine", "openpyxl")
+                    pandas_df = pd.read_excel(
+                        BytesIO(decrypted_bytes),
+                        dtype=str,
+                        engine=excel_engine
+                    )
                 else:
                     raise Exception(f"Unsupported extension: {expected_extension}")
 
+                # Rename columns by position
+                pandas_df.columns = entity_config['required_columns']
+                
                 spark_df = self.spark.createDataFrame(pandas_df.astype(str).replace('nan', '').replace('NaT', ''))
-                # Do your Spark DQ checks here...
-                # self._update_audit_log(status="Succeeded")
+
+                # --- DATA VALIDATION (DQ) ---
+                self.logger.info("Starting data validation (DQ checks)...")
+                dq_validator = DataValidator(
+                    df=spark_df,
+                    config=entity_config,
+                    logger=self.logger,
+                    file_name=os.path.basename(file_key)
+                )
+                clean_df = dq_validator.run_all_checks()
+                audit_info = dq_validator.get_audit_info()
+
+                if clean_df is None:
+                    self.logger.error(f"File rejected during data validation: {audit_info}")
+                    # --- AUDIT & REJECTION HANDLING ---
+                    # You can do: dq_validator.write_rejected_records(...) or custom S3/DB logic here
+                    # Optionally send notification:
+                    self._send_notification(f"File rejected during DQ: {audit_info}")
+                else:
+                    self.logger.info("Data validation PASSED, continuing downstream processing.")
+                    # Continue with clean_df
+                    # For example: clean_df.write.mode("overwrite").saveAsTable(...)
+                    # Or further business logic, audit log update, etc.
+
             else:
                 self.logger.error("File validation FAILED.")
                 error_message = f"File validation failed for {file_key}. See log for details."
-                # self._update_audit_log(status="Failed", error_message=error_message)
                 self._send_notification(error_message)
         except Exception as e:
-            error_message = f"Exception during file validation: {str(e)}"
+            error_message = f"Exception during file or data validation: {str(e)}"
             self.logger.error(error_message)
             self.logger.error(traceback.format_exc())
-            # self._update_audit_log(status="Failed", error_message=error_message)
             self._send_notification(error_message)
 
 if __name__ == "__main__":
