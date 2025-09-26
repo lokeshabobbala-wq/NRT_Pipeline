@@ -1,7 +1,7 @@
 {
   "EGI_2_0_EMEA_INC": {
-    "input_file_extension": ".xlsx",
-    "file_pattern": "^EGI_2_0_EMEA_INC_\\d{8}\\.xlsx$",
+    "input_file_extension": "xlsx",
+    "file_pattern": "^EGI_2_0_EMEA_INC_\\d{14}\\.xlsx$",
     "sheet_name": "Report 1",
     "required_columns": [
       "CP_Backlog_SNI_Revenue",
@@ -106,3 +106,4 @@
     "timestamp_columns": []
   }
 }
+
