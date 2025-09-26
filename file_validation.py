@@ -8,34 +8,34 @@ coding standards and docstring/logging/error-handling style of sc360-dev-nrt-dat
 """
 
 import os
-import logging
 import boto3
 import csv
 import codecs
-import psycopg2
 import datetime as dt
 import ast
 from botocore.exceptions import ClientError
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+from kms_decrypt_util import KMSDecryptionHelper
+import aws_encryption_sdk
+from aws_encryption_sdk.identifiers import CommitmentPolicy
+from aws_encryption_sdk.key_providers.kms import StrictAwsKmsMasterKeyProvider
 
 class FileValidator:
     """
     Class for validating files landed in S3 as per pipeline checklist.
 
     Usage:
-        validator = FileValidator(bucket, region, ...)
-        result = validator.validate_file(file_key)
+        validator = FileValidator(bucket, region, logger, allowed_prefixes, rds_secret_name, expected_extension)
+        result = validator.validate_file(file_key, metadata_key, file_config)
     """
 
-    def __init__(self, bucket, region, allowed_prefixes, rds_secret_name, expected_extension, max_sla_hours=2):
+    def __init__(self, bucket, region, logger, allowed_prefixes, rds_secret_name, expected_extension, kms_id=None, max_sla_hours=2):
         """
         Initialize FileValidator.
 
         Args:
             bucket (str): S3 bucket name.
             region (str): Region name.
+            logger: logger object (your custom Logging instance).
             allowed_prefixes (list): Expected file prefixes for name validation.
             rds_secret_name (str): Secret name for RDS credentials (for audit logging).
             expected_extension (str): Allowed file extension (e.g. 'csv').
@@ -43,76 +43,85 @@ class FileValidator:
         """
         self.bucket = bucket
         self.region = region
+        self.logger = logger
         self.allowed_prefixes = allowed_prefixes
         self.expected_extension = expected_extension
         self.max_sla_hours = max_sla_hours
+        self.kms_id = kms_id
         self.s3 = boto3.client('s3')
         self.rds_secret_name = rds_secret_name
-        self.conn = self.get_db_connection(rds_secret_name)
-
-    def get_db_connection(self, secret_name):
-        """
-        Get psycopg2 connection using AWS Secrets Manager.
-        """
-        try:
-            region_name = os.environ.get("AWS_REGION", "us-east-1")
-            secrets_client = boto3.client('secretsmanager', region_name=region_name)
-            logger.info(f"Fetching RDS credentials from Secrets Manager: {secret_name}")
-            response = secrets_client.get_secret_value(SecretId=secret_name)
-            if response['ResponseMetadata']['HTTPStatusCode'] == 200:
-                creds = ast.literal_eval(response['SecretString'])
-                conn_string = (
-                    f"dbname='{creds['engine']}' port='{creds['port']}' user='{creds['username']}' "
-                    f"password='{creds['password']}' host='{creds['host']}'"
-                )
-                logger.info("Establishing database connection to RDS...")
-                connection = psycopg2.connect(conn_string)
-                logger.info("Database connection successful.")
-                return connection
-            else:
-                logger.error("Failed to retrieve credentials for RDS.")
-                raise RuntimeError("Failed to retrieve credentials for RDS.")
-        except Exception as e:
-            logger.error(f"Error getting RDS DB connection: {e}")
-            raise
-
-    def list_s3_objects(self, prefix):
-        """
-        List all object keys under the given prefix.
-        """
-        try:
-            paginator = self.s3.get_paginator('list_objects_v2')
-            page_iterator = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-            keys = []
-            for page in page_iterator:
-                keys.extend([obj['Key'] for obj in page.get('Contents', [])])
-            logger.info(f"Found {len(keys)} objects under prefix {prefix}")
-            return keys
-        except Exception as e:
-            logger.error(f"Error listing objects in S3: {e}")
-            raise
 
     def check_file_presence(self, key):
-        """
-        Check if a file exists in S3.
-        """
         try:
             self.s3.head_object(Bucket=self.bucket, Key=key)
-            logger.info(f"File found: s3://{self.bucket}/{key}")
+            self.logger.info(f"File found: s3://{self.bucket}/{key}")
             return True
         except ClientError as e:
             if e.response['Error']['Code'] == '404':
-                logger.warning(f"File not found: s3://{self.bucket}/{key}")
+                self.logger.error(f"File not found: s3://{self.bucket}/{key}")
                 return False
-            logger.error(f"Error in head_object: {e}")
+            self.logger.error(f"Error in head_object: {e}")
             raise
 
     def check_file_naming_pattern(self, filename):
-        """
-        Check if filename starts with any allowed prefix.
-        """
         is_valid = any(filename.startswith(prefix) for prefix in self.allowed_prefixes)
-        logger.info(f"Naming pattern check for {filename}: {is_valid}")
+        self.logger.info(f"Naming pattern check for {filename}: {is_valid}")
+        return is_valid
+
+    def check_file_size(self, key):
+        """
+        Check the file size using list_objects_v2 for a single file.
+        """
+        try:
+            # Use list_objects_v2 to get metadata for files under the given prefix (key)
+            response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=key, MaxKeys=1)
+
+            # Validate if the file exists
+            if 'Contents' not in response or len(response['Contents']) == 0:
+                self.logger.error(f"File {key} not found in bucket {self.bucket}.")
+                return False
+
+            # Get the file size from the first (and expected only) object in the response
+            file_size = response['Contents'][0]['Size']
+            self.logger.info(f"File {key} size: {file_size}")
+            
+            # Return True if the file size is greater than 0
+            return file_size > 0
+
+        except Exception as e:
+            self.logger.error(f"Error getting file size for {key}: {e}")
+            return False
+
+
+    def check_file_extension(self, filename):
+        ext = filename.split('.')[-1].lower()
+        is_valid = ext == self.expected_extension.lower()
+        self.logger.info(f"Extension check: {ext} vs allowed {self.expected_extension.lower()} = {is_valid}")
+        return is_valid
+
+    def check_kms_encryption(self, key):
+        resp = self.s3.head_object(Bucket=self.bucket, Key=key)
+        enc = resp.get('ServerSideEncryption')
+        self.logger.info(f"KMS encryption: {enc}")
+        return enc == 'aws:kms'
+
+    def check_file_integrity(self, key):
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+            next(csv.reader(codecs.getreader("utf-8")(obj["Body"])))
+            self.logger.info(f"File {key} opened successfully (integrity pass).")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to open file {key}: {e}")
+            return False
+
+    def check_timeliness(self, key):
+        import datetime
+        last_modified = self.s3.head_object(Bucket=self.bucket, Key=key)['LastModified']
+        now = datetime.datetime.utcnow().replace(tzinfo=last_modified.tzinfo)
+        delta = (now - last_modified).total_seconds() / 3600
+        is_valid = delta <= self.max_sla_hours
+        self.logger.info(f"Timeliness check for {key}: {delta:.2f} hours old (valid={is_valid})")
         return is_valid
 
     def find_metadata_file(self, data_filename, metadata_files):
@@ -122,79 +131,53 @@ class FileValidator:
         base = data_filename.split('.')[0]
         for m in metadata_files:
             if m.startswith(f"SC360metadata_{base}"):
-                logger.info(f"Matching metadata file for {data_filename}: {m}")
+                self.logger.info(f"Matching metadata file for {data_filename}: {m}")
                 return m
-        logger.warning(f"No metadata found for {data_filename}")
+        self.logger.error(f"No metadata found for {data_filename}")
         return None
-
-    def check_file_size(self, key):
-        """
-        Check file size > 0.
-        """
-        size = self.s3.head_object(Bucket=self.bucket, Key=key)['ContentLength']
-        logger.info(f"File {key} size: {size}")
-        return size > 0
-
+    
     def check_file_size_matches_metadata(self, data_key, metadata_key):
         """
-        Check that file size matches value in metadata file.
+        Check that decrypted file size matches the value specified in the metadata file.
+        Handles KMS-encrypted data and metadata files if necessary.
         """
         try:
-            file_size = self.s3.head_object(Bucket=self.bucket, Key=data_key)['ContentLength']
-            m_obj = self.s3.get_object(Bucket=self.bucket, Key=metadata_key)
-            metadataInfo = list(csv.reader(codecs.getreader("utf-8")(m_obj["Body"])))
+            # Step 1: Decrypt metadata file if KMS encrypted
+            plaintext_meta = self.check_kms_encryption_and_decrypt(metadata_key)
+            if plaintext_meta is None:
+                m_obj = self.s3.get_object(Bucket=self.bucket, Key=metadata_key)
+                raw_content = m_obj["Body"].read().decode("utf-8")
+            else:
+                raw_content = plaintext_meta.decode("utf-8")
+
+            # Parse metadata CSV
+            import csv
+            metadataInfo = list(csv.reader(raw_content.splitlines()))
+            metadataInfo = [row for row in metadataInfo if row]
             if not metadataInfo:
-                logger.warning("Metadata file is empty.")
+                self.logger.error("Metadata file is empty or malformed.")
                 return False
+
             size_from_meta = int(metadataInfo[0][0].split('|')[1])
-            logger.info(f"File size from meta: {size_from_meta}, actual: {file_size}")
-            return file_size == size_from_meta
+
+            # Step 2: Decrypt data file if KMS encrypted
+            plaintext_data = self.check_kms_encryption_and_decrypt(data_key)
+            if plaintext_data is None:
+                # Not encrypted, fetch directly
+                d_obj = self.s3.get_object(Bucket=self.bucket, Key=data_key)
+                data_bytes = d_obj["Body"].read()
+            else:
+                data_bytes = plaintext_data
+
+            # Step 3: Compare sizes
+            actual_size = len(data_bytes)
+            self.logger.info(f"File size from metadata: {size_from_meta}, decrypted file size: {actual_size}")
+            return actual_size == size_from_meta
+
         except Exception as e:
-            logger.error(f"Error checking file size against metadata: {e}")
+            self.logger.error(f"Error checking file size against metadata: {e}")
             return False
 
-    def check_file_extension(self, filename):
-        """
-        Check the file extension.
-        """
-        ext = filename.split('.')[-1].lower()
-        is_valid = ext == self.expected_extension.lower()
-        logger.info(f"Extension check: {ext} vs allowed {self.expected_extension.lower()} = {is_valid}")
-        return is_valid
-
-    def check_kms_encryption(self, key):
-        """
-        Check if the file is encrypted with KMS.
-        """
-        resp = self.s3.head_object(Bucket=self.bucket, Key=key)
-        enc = resp.get('ServerSideEncryption')
-        logger.info(f"KMS encryption: {enc}")
-        return enc == 'aws:kms'
-
-    def check_file_integrity(self, key):
-        """
-        Check if file can be opened (CSV header read).
-        """
-        try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            next(csv.reader(codecs.getreader("utf-8")(obj["Body"])))
-            logger.info(f"File {key} opened successfully (integrity pass).")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to open file {key}: {e}")
-            return False
-
-    def check_timeliness(self, key):
-        """
-        Check if file is within allowed SLA window (default 2 hours).
-        """
-        import datetime
-        last_modified = self.s3.head_object(Bucket=self.bucket, Key=key)['LastModified']
-        now = datetime.datetime.utcnow().replace(tzinfo=last_modified.tzinfo)
-        delta = (now - last_modified).total_seconds() / 3600
-        is_valid = delta <= self.max_sla_hours
-        logger.info(f"Timeliness check for {key}: {delta:.2f} hours old (valid={is_valid})")
-        return is_valid
 
     def check_duplicates(self, file_list):
         """
@@ -204,120 +187,91 @@ class FileValidator:
         for f in file_list:
             base = "_".join(f.split('/')[-1].split('_')[:-1])
             if base in seen:
-                logger.warning("Duplicate file found: " + f)
+                self.logger.error("Duplicate file found: " + f)
                 return True
             seen.add(base)
-        logger.info("No duplicates found.")
+        self.logger.info("No duplicates found.")
         return False
 
-    def audit_log(self, **kwargs):
+    def check_kms_encryption_and_decrypt(self, key):
         """
-        Insert an audit log record. (Params should match DB columns.)
+        If file is KMS encrypted, decrypt and return plaintext bytes.
+        If not, returns None.
         """
-        insert_sql = """
-        INSERT INTO audit.sc360_audit_log(
-            batchid, batchrundate, regionname, datapipelinename, pipelinerunid, processname,
-            filename, sourcename, destinationname, sourceplatform, targetplatform, activity,
-            environment, interval, scriptpath, executionstatus, errormessage, datareadsize,
-            datawrittensize, logtimestamp)
-        VALUES(%(BatchId)s, %(BatchRunDate)s, %(pRegionName)s, %(pDataPipelineName)s, %(pDataPipelineId)s,
-               %(ProcessName)s, %(fileName)s, %(sourceName)s, %(destinationName)s, %(SourcePlatform)s, %(TargetPlatform)s,
-               %(Activity)s, %(Environment)s, %(pScheduleType)s, %(emrMasterScriptPath)s, %(executionStatus)s, %(errorMessage)s,
-               %(dataReadSize)s, %(dataWrittenSize)s, %(logTimestamp)s )
-        """
-        cursor = self.conn.cursor()
-        cursor.execute(insert_sql, kwargs)
-        self.conn.commit()
-        logger.info(f"Audit log committed for {kwargs.get('fileName')}.")
-
-    def move_to_folder(self, src_folder, dst_folder, file, meta_file=None):
-        """
-        Move a file (+ optional metadata file) to another folder (e.g. reject/quarantine/await).
-        """
-        def move_one(fname):
-            if fname:
-                src_key = f"{src_folder}{fname}"
-                dst_key = f"{dst_folder}{fname}"
-                self.s3.copy_object(Bucket=self.bucket, Key=dst_key, CopySource={'Bucket': self.bucket, 'Key': src_key})
-                self.s3.delete_object(Bucket=self.bucket, Key=src_key)
-                logger.info(f"Moved {src_key} to {dst_key}")
-        move_one(file)
-        if meta_file:
-            move_one(meta_file)
-
-    # Example main method to validate all files under a prefix
-    def validate_all_files(self, landing_folder, reject_folder, await_folder, batch_id, batch_run_date, schedule_type, emr_script_path):
-        """
-        Run all file validation steps as per checklist on all data files in landing_folder.
-        """
+        if not self.kms_id:
+            self.logger.info("No KMS_ID provided, skipping decryption.")
+            return None
         try:
-            all_keys = self.list_s3_objects(landing_folder)
-            data_files = [k.split('/')[-1] for k in all_keys if not k.endswith('/') and not k.split('/')[-1].startswith('SC360metadata_')]
-            metadata_files = [k.split('/')[-1] for k in all_keys if k.split('/')[-1].startswith('SC360metadata_')]
-
-            for data_file in data_files:
-                logger.info(f"Validating {data_file}")
-                # 2. Naming
-                if not self.check_file_naming_pattern(data_file):
-                    self.move_to_folder(landing_folder, reject_folder, data_file)
-                    continue
-                # 3. Metadata
-                meta_file = self.find_metadata_file(data_file, metadata_files)
-                if not meta_file:
-                    self.move_to_folder(landing_folder, await_folder, data_file)
-                    continue
-                # 4. Size
-                if not self.check_file_size(f"{landing_folder}{data_file}"):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 5. Size match
-                if not self.check_file_size_matches_metadata(f"{landing_folder}{data_file}", f"{landing_folder}{meta_file}"):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 6. Extension
-                if not self.check_file_extension(data_file):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 7. KMS
-                if not self.check_kms_encryption(f"{landing_folder}{data_file}"):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 8. Integrity
-                if not self.check_file_integrity(f"{landing_folder}{data_file}"):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 9. Timeliness
-                if not self.check_timeliness(f"{landing_folder}{data_file}"):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 10. Duplicates
-                if self.check_duplicates(data_files):
-                    self.move_to_folder(landing_folder, reject_folder, data_file, meta_file)
-                    continue
-                # 11. Audit log
-                self.audit_log(
-                    BatchId=batch_id,
-                    BatchRunDate=batch_run_date,
-                    pRegionName=self.region,
-                    pDataPipelineName="NRT_Pipeline",
-                    pDataPipelineId="24532",
-                    ProcessName="FileValidation",
-                    fileName=data_file,
-                    sourceName=data_file,
-                    destinationName=data_file,
-                    SourcePlatform="S3",
-                    TargetPlatform="S3",
-                    Activity="Validation",
-                    Environment=os.environ.get('env', 'dev'),
-                    pScheduleType=schedule_type,
-                    emrMasterScriptPath=emr_script_path,
-                    executionStatus="ReadyToExecute",
-                    errorMessage="",
-                    dataReadSize=self.s3.head_object(Bucket=self.bucket, Key=f"{landing_folder}{data_file}")['ContentLength'],
-                    dataWrittenSize=0,
-                    logTimestamp=dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                )
-                logger.info(f"{data_file} validated and logged as ReadyToExecute.")
+            self.logger.info(f"Attempting to decrypt file {key} using KMS_ID: {self.kms_id}")
+            decrypt_helper = KMSDecryptionHelper(self.kms_id, self.region)
+            plaintext = decrypt_helper.decrypt_s3_object(self.bucket, key, is_base64=True)
+            self.logger.info(f"Decryption successful for {key}")
+            return plaintext
         except Exception as e:
-            logger.error(f"Unhandled error in file validation: {e}")
-            raise
+            self.logger.error(f"Decryption failed for {key}: {e}")
+            return None
+    
+    def validate_file(self, file_key, metadata_key, file_config, all_data_keys=None, all_metadata_keys=None):
+        filename = file_key.split('/')[-1]
+        self.logger.info(f"Starting validation for file: {file_key}")
+
+        if not self.check_file_presence(file_key):
+            self.logger.error("File presence check failed.")
+            return False
+
+        if not self.check_file_naming_pattern(filename):
+            self.logger.error("File naming pattern check failed.")
+            return False
+
+        # Matching Metadata File Exists
+        if not metadata_key and all_metadata_keys is not None:
+            metadata_key = self.find_metadata_file(filename, all_metadata_keys)
+            if not metadata_key:
+                self.logger.error("Matching metadata file check failed.")
+                return False
+        elif not metadata_key:
+            self.logger.error("No metadata key provided for metadata existence check.")
+            return False
+
+        if not self.check_file_size(file_key):
+            self.logger.error("File size check failed (empty file).")
+            return False
+        
+        # File Size Matches Metadata
+        if not self.check_file_size_matches_metadata(file_key, metadata_key):
+            self.logger.error("File size matches metadata check failed.")
+            return False
+        
+        if not self.check_file_extension(filename):
+            self.logger.error("File extension/type check failed.")
+            return False
+
+        # KMS DECRYPTION/VALIDATION
+        decrypted_bytes = None
+        try:
+            decrypted_bytes = self.check_kms_encryption_and_decrypt(file_key)
+        except Exception as e:
+            self.logger.error(f"KMS decryption failed: {e}")
+            return False
+
+        # File integrity: try to open as CSV -- use decrypted bytes if present
+        try:
+            if decrypted_bytes:
+                csv.reader(codecs.iterdecode(decrypted_bytes.splitlines(), "utf-8")).__next__()
+            else:
+                self.check_file_integrity(file_key)
+        except Exception as e:
+            self.logger.error(f"File integrity check failed: {e}")
+            return False
+        
+        if not self.check_timeliness(file_key):
+            self.logger.error("File timeliness/SLA check failed.")
+            return False
+        
+        # Duplicate Check
+        if all_data_keys is not None and self.check_duplicates(all_data_keys):
+            self.logger.error("Duplicate check failed.")
+            return False
+        
+        self.logger.info(f"All validation checks passed for {file_key}")
+        return True
