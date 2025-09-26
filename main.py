@@ -7,12 +7,47 @@ from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
 from io import BytesIO
 import pandas as pd
+import numpy as np
 from io import BytesIO, StringIO
-from pyspark.sql.functions import concat_ws, sha2, col, lit, current_timestamp
+from pyspark.sql.functions import concat_ws, sha2, col, lit, current_timestamp, udf, current_date
+from pyspark.sql.types import StringType, DateType, TimestampType, DecimalType
 
 from logging_util import Logging
 from file_validation import FileValidator
 from data_validation import DataValidator  # <-- Import the new class
+
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from awsglue.dynamicframe import DynamicFrame
+
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+
+def apply_column_mapping_with_withColumn(df, mapping):
+    from pyspark.sql.functions import col, lit, concat_ws, udf
+    from pyspark.sql.types import StringType, TimestampType, DateType
+
+    def fiscal_quarter_from_date(date_str):
+        if not date_str or len(date_str) < 7:
+            return None
+        y, m = date_str[:4], int(date_str[5:7])
+        q = ((m - 1) // 3) + 1
+        return f"{y}-Q{q}"
+
+    fiscal_quarter_udf = udf(fiscal_quarter_from_date, StringType())
+
+    for tgt, spec in mapping.items():
+        if "source" in spec:
+            df = df.withColumn(tgt, col(spec["source"]))
+        elif "lit" in spec:
+            df = df.withColumn(tgt, lit(spec["lit"]))
+        elif "concat_ws" in spec:
+            sep = spec["concat_ws"].get("sep", "")
+            cols = spec["concat_ws"]["columns"]
+            df = df.withColumn(tgt, concat_ws(sep, *[col(c) for c in cols]))
+        elif "function" in spec and spec["function"] == "fiscal_quarter_from_date":
+            df = df.withColumn(tgt, fiscal_quarter_udf(col(spec["args"][0])))
+    return df
 
 class NRTGlueJob:
     def __init__(self):
@@ -122,21 +157,27 @@ class NRTGlueJob:
                 from io import BytesIO, StringIO
 
                 if expected_extension.lower() == "csv":
-                    pandas_df = pd.read_csv(StringIO(decrypted_bytes.decode("utf-8")), dtype=str)
+                    pandas_df = pd.read_csv(StringIO(decrypted_bytes.decode("utf-8")))
                 elif expected_extension.lower() in ("xlsx", "xls"):
                     excel_engine = entity_config.get("excel_engine", "openpyxl")
-                    pandas_df = pd.read_excel(
-                        BytesIO(decrypted_bytes),
-                        dtype=str,
-                        engine=excel_engine
-                    )
+                    #pandas_df = pd.read_excel(BytesIO(decrypted_bytes),dtype=str,engine=excel_engine)
+                    pandas_df = pd.read_excel(BytesIO(decrypted_bytes), engine=excel_engine)
                 else:
                     raise Exception(f"Unsupported extension: {expected_extension}")
 
                 # Rename columns by position
                 pandas_df.columns = entity_config['required_columns']
+                import numpy as np
+
+                # Replace np.nan and NaT with None (Spark will interpret as null)
+                pandas_df = pandas_df.replace({np.nan: None, pd.NaT: None})
                 
-                spark_df = self.spark.createDataFrame(pandas_df.astype(str).replace('nan', '').replace('NaT', ''))
+                # Now create Spark DataFrame (types will be inferred, not forced to string)
+                spark_df = self.spark.createDataFrame(pandas_df)
+                spark_df.select("order_create_calendar_date").show()
+                
+                
+                #spark_df = self.spark.createDataFrame(pandas_df.astype(str).replace('nan', '').replace('NaT', ''))
 
                 # --- DATA VALIDATION (DQ) ---
                 self.logger.info("Starting data validation (DQ checks)...")
@@ -147,8 +188,16 @@ class NRTGlueJob:
                     file_name=os.path.basename(file_key)
                 )
                 clean_df = dq_validator.run_all_checks()
+                
                 audit_info = dq_validator.get_audit_info()
-
+                column_type_map = entity_config['column_type_map']
+                from pyspark.sql.functions import col
+                from pyspark.sql.types import DecimalType
+                
+                # Example: decimal precision and scale
+                DECIMAL_PRECISION = 30
+                DECIMAL_SCALE = 15
+                print("200")
                 if clean_df is None:
                     self.logger.error(f"File rejected during data validation: {audit_info}")
                     # --- AUDIT & REJECTION HANDLING ---
@@ -158,25 +207,65 @@ class NRTGlueJob:
                 else:
                     self.logger.info("Data validation PASSED, continuing downstream processing.")
                     
+                    # --- Column Mapping ---
+                    column_mapping = entity_config.get("column_mapping", {})
+                    mapped_df = apply_column_mapping_with_withColumn(clean_df, column_mapping)
+                    print("213")
                     # ---- HASH GENERATION ----
                     from pyspark.sql.functions import concat_ws, sha2, col
                     hash_columns = entity_config.get("hash_columns", [])
                     hash_column_name = entity_config.get("hash_column_name", "record_hash")
                     watermark_column = entity_config.get("watermark_column", "event_time")  # or your actual watermark field name
-                    source_file = os.path.basename(file_key)
+                    source_file_name = os.path.basename(file_key)
                     if hash_columns:
-                        clean_df = clean_df.withColumn(hash_column_name, sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256))\
-                                            .withColumn("watermark", col(watermark_column))\
-                                            .withColumn("source_file", lit(source_file))\
-                                            .withColumn("ingestion_ts", current_timestamp())
-
+                        final_df = (
+                            mapped_df
+                            .withColumn(hash_column_name, sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256))
+                            .withColumn("source_file_name", lit(source_file_name))
+                            .withColumn("batch_run_dt", lit(current_timestamp()).cast(TimestampType()))
+                            .withColumn("created_by", lit("glue"))
+                            .withColumn("create_dt", lit(current_date()).cast(DateType()))
+                            .withColumn("source_nm", lit("sc360-dev-nrt-dataload-processor"))
+                        )
                         self.logger.info(f"Hash column '{hash_column_name}' generated using columns {hash_columns}.")
                     else:
                         self.logger.warning("No hash_columns defined in config; hash_code not generated.")
-
+                    print("233")    
+                    for col_name, dtype in column_type_map.items():
+                        if dtype == "string":
+                            final_df = final_df.withColumn(col_name, col(col_name).cast("string"))
+                        elif dtype == "date":
+                            final_df = final_df.withColumn(col_name, col(col_name).cast("date"))
+                        elif dtype == "timestamp":
+                            final_df = final_df.withColumn(col_name, col(col_name).cast("timestamp"))
+                        elif dtype.startswith("decimal"):
+                            final_df = final_df.withColumn(col_name, col(col_name).cast(DecimalType(DECIMAL_PRECISION, DECIMAL_SCALE)))
+                            
+                    # Assume your DataFrame is named df
+                    for field in final_df.schema.fields:
+                        print(f"{field.name}: {field.dataType}")
+                    # Convert Spark DataFrame to AWS Glue DynamicFrame
+                    dyf = DynamicFrame.fromDF(final_df, glueContext, "dyf_final")
+                    
+                    # Redshift connection options
+                    redshift_options = {
+                        "url": "jdbc:redshift://sc360-dev-redshiftcluster.cjjh5rkigghp.us-east-1.redshift.amazonaws.com:5439/devdb",
+                        "user": "arubauser",
+                        "password": "2020Sept01",
+                        "dbtable": "curated.CUR_REVENUE_EGI_NRT",
+                        "redshiftTmpDir": "s3://sc360-dev-ww-nrt-bucket/staging/",  # <-- Replace with your S3 path!
+                        "mode": "overwrite"
+                    }
+                    
+                    # Write to Redshift using S3 staging (recommended for performance!)
+                    glueContext.write_dynamic_frame.from_options(
+                        frame=dyf,
+                        connection_type="redshift",
+                        connection_options=redshift_options
+                    )
                     # Continue with clean_df (with hash_code column added)
                     # For example: clean_df.write.mode("overwrite").saveAsTable(...)
-
+                
             else:
                 self.logger.error("File validation FAILED.")
                 error_message = f"File validation failed for {file_key}. See log for details."
