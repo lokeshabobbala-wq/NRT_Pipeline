@@ -8,10 +8,10 @@ This Lambda function is triggered when a metadata file is uploaded with prefix
 'LandingZone/SC360metadata' in the S3 bucket. On trigger:
 
 1. Extracts main filename from metadata file name.
-2. Queries audit_config table in RDS for allowed extension for the base filename.
+2. Queries audit_config table in RDS for allowed extension and all config for the base filename.
 3. Checks if the main file with required extension exists in S3.
 4. If missing, sends SNS notification and exits.
-5. If present, triggers Glue job for processing.
+5. If present, triggers Glue job for processing with config_file_s3_path, curated_table, published_table, and full config.
 6. Logs all steps for traceability and error diagnosis.
 
 Environment Variables Required:
@@ -123,34 +123,22 @@ def extract_base_filename(main_filename):
     logger.info(f"Extracted base filename: {base}")
     return base
 
-def get_expected_extension(conn, base_filename):
+def get_full_config_dict(conn, file_key):
     """
-    Queries audit_config table for expected file extension for the base filename.
-
-    Args:
-        conn (psycopg2.extensions.connection): Database connection object.
-        base_filename (str): Extracted base file name.
-
-    Returns:
-        str: Expected file extension (e.g., 'csv', 'xlsx').
-
-    Raises:
-        Exception: If query fails or no extension is found.
+    Fetches the entire config row as a dict for the given file_key.
     """
-    logger.info(f"Querying audit_config for expected extension for base filename: {base_filename}")
+    logger.info(f"Fetching full config for file_key: {file_key}")
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT file_format FROM audit.sc360_nrt_file_config WHERE file_key = %s LIMIT 1", (base_filename,))
-            result = cur.fetchone()
-            if result:
-                expected_ext = result[0]
-                logger.info(f"Found expected extension '{expected_ext}' for base filename '{base_filename}'")
-                return expected_ext
-            else:
-                logger.error(f"No expected extension found in audit_config for base filename '{base_filename}'")
-                raise ValueError(f"No expected extension found in audit_config for base filename '{base_filename}'")
+            cur.execute("SELECT * FROM audit.sc360_nrt_file_config WHERE file_key = %s LIMIT 1", (file_key,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"No config found for file_key: {file_key}")
+            colnames = [desc[0] for desc in cur.description]
+            config_dict = dict(zip(colnames, row))
+            return config_dict
     except Exception as e:
-        logger.error(f"Error querying audit_config table: {e}")
+        logger.error(f"Error fetching full config: {e}")
         raise
 
 def check_main_file_exists(s3_client, bucket, main_filename, expected_extension):
@@ -183,7 +171,7 @@ def check_main_file_exists(s3_client, bucket, main_filename, expected_extension)
             logger.error(f"Error checking main file in S3: {e}")
             raise
 
-def trigger_glue_job(bucket, main_key, metadata_key):
+def trigger_glue_job(bucket, main_key, metadata_key, config_file_s3_path, curated_table, published_table, full_config):
     """
     Triggers the Glue job with S3 bucket, main file key, and metadata file key as arguments.
 
@@ -201,21 +189,22 @@ def trigger_glue_job(bucket, main_key, metadata_key):
     glue = boto3.client('glue')
     job_name = os.environ['GLUE_JOB_NAME']
     logger.info(f"Triggering Glue job '{job_name}' for main file: s3://{bucket}/{main_key} and metadata file: s3://{bucket}/{metadata_key}")
-    try:
-        response = glue.start_job_run(
-            JobName=job_name,
-            Arguments={
-                '--S3_BUCKET': bucket,
-                '--MAIN_KEY': main_key,
-                '--METADATA_KEY': metadata_key
-            }
-        )
-        job_run_id = response['JobRunId']
-        logger.info(f"Glue job started successfully. JobRunId: {job_run_id}")
-        return job_run_id
-    except ClientError as e:
-        logger.error(f"Glue job trigger failed: {e}")
-        raise
+    arguments = {
+        '--S3_BUCKET': bucket,
+        '--MAIN_KEY': main_key,
+        '--METADATA_KEY': metadata_key,
+        '--CONFIG_S3_PATH': config_file_s3_path,
+        '--CURATED_TABLE': curated_table,
+        '--PUBLISHED_TABLE': published_table,
+        '--FULL_CONFIG': json.dumps(full_config, default=str)
+    }
+    response = glue.start_job_run(
+        JobName=job_name,
+        Arguments=arguments
+    )
+    job_run_id = response['JobRunId']
+    logger.info(f"Glue job started successfully. JobRunId: {job_run_id}")
+    return job_run_id
 
 def publish_sns_notification(topic_arn, subject, message):
     """
@@ -298,10 +287,14 @@ def lambda_handler(event, context):
                 )
             return {"status": "error", "message": str(ve)}
         
-        # 3. Connect to RDS and get expected extension for main file
+        # 3. Connect to RDS and get full config for main file
         try:
             conn = get_db_connection(secret_name)
-            expected_extension = get_expected_extension(conn, base_filename)
+            full_config = get_full_config_dict(conn, base_filename)
+            expected_extension = full_config["file_format"]
+            config_file_s3_path = full_config["config_file_s3_path"]
+            curated_table = full_config["curated_table"]
+            published_table = full_config["published_table"]
         except Exception as db_err:
             logger.error(f"RDS connection or config lookup failed: {db_err}")
             return {"status": "error", "message": "DB connection or config lookup error"}
@@ -323,9 +316,17 @@ def lambda_handler(event, context):
                 )
             return {"status": "error", "message": str(fnf_err)}
         
-        # 5. Trigger Glue job for both main and metadata files
+        # 5. Trigger Glue job for both main and metadata files, passing all config
         try:
-            job_run_id = trigger_glue_job(bucket, main_key, metadata_key)
+            job_run_id = trigger_glue_job(
+                bucket,
+                main_key,
+                metadata_key,
+                config_file_s3_path,
+                curated_table,
+                published_table,
+                full_config
+            )
             logger.info(f"Glue job started for main file: {main_key}, metadata file: {metadata_key}, JobRunId: {job_run_id}")
         except Exception as glue_err:
             logger.error(f"Failed to trigger Glue job: {glue_err}")
