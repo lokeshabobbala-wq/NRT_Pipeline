@@ -6,6 +6,9 @@ import traceback
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
 from io import BytesIO
+import pandas as pd
+from io import BytesIO, StringIO
+from pyspark.sql.functions import concat_ws, sha2, col, lit, current_timestamp
 
 from logging_util import Logging
 from file_validation import FileValidator
@@ -154,9 +157,25 @@ class NRTGlueJob:
                     self._send_notification(f"File rejected during DQ: {audit_info}")
                 else:
                     self.logger.info("Data validation PASSED, continuing downstream processing.")
-                    # Continue with clean_df
+                    
+                    # ---- HASH GENERATION ----
+                    from pyspark.sql.functions import concat_ws, sha2, col
+                    hash_columns = entity_config.get("hash_columns", [])
+                    hash_column_name = entity_config.get("hash_column_name", "record_hash")
+                    watermark_column = entity_config.get("watermark_column", "event_time")  # or your actual watermark field name
+                    source_file = os.path.basename(file_key)
+                    if hash_columns:
+                        clean_df = clean_df.withColumn(hash_column_name, sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256))\
+                                            .withColumn("watermark", col(watermark_column))\
+                                            .withColumn("source_file", lit(source_file))\
+                                            .withColumn("ingestion_ts", current_timestamp())
+
+                        self.logger.info(f"Hash column '{hash_column_name}' generated using columns {hash_columns}.")
+                    else:
+                        self.logger.warning("No hash_columns defined in config; hash_code not generated.")
+
+                    # Continue with clean_df (with hash_code column added)
                     # For example: clean_df.write.mode("overwrite").saveAsTable(...)
-                    # Or further business logic, audit log update, etc.
 
             else:
                 self.logger.error("File validation FAILED.")
