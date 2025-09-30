@@ -84,7 +84,7 @@ class NRTGlueJob:
                 'S3_BUCKET', 'MAIN_KEY', 'METADATA_KEY', 'CONFIG_S3_PATH',
                 'CURATED_TABLE', 'PUBLISHED_TABLE', 'FULL_CONFIG',
                 'database', 'env', 'resourcearn',
-                'schema', 'secretarn', 'sns_arn', 'KMS_ID'
+                'schema', 'secretarn', 'sns_arn', 'KMS_ID', 'redshift_secret_name', 'rds_secret_name'
             ]
         )
 
