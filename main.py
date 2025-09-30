@@ -21,6 +21,30 @@ from file_validation import FileValidator
 from data_validation import DataValidator
 from sql_generator import SCD2SQLGenerator
 
+import boto3
+import ast
+
+def get_redshift_secret(secret_name, region_name="us-east-1"):
+    secrets_client = boto3.client('secretsmanager', region_name=region_name)
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        print(f"Successfully retrieved credentials for {secret_name}")
+        creds = ast.literal_eval(response['SecretString'])
+        dbname = creds.get("redshift_database") or creds.get("engine")  # Handle Redshift & RDS
+        port = creds.get("redshift_port") or creds.get("port")
+        username = creds.get("redshift_username") or creds.get("username")
+        password = creds.get("redshift_password") or creds.get("password")
+        host = creds.get("redshift_host") or creds.get("host")
+        return {
+            "dbname": dbname,
+            "port": port,
+            "username": username,
+            "password": password,
+            "host": host
+        }
+    else:
+        raise Exception(f"Failed to retrieve credentials for {secret_name}")
+
 def fiscal_quarter_from_date(date_val):
     """
     Derives fiscal quarter string from a date value.
@@ -71,7 +95,14 @@ class NRTGlueJob:
         self.full_config = self._load_full_config()
         self.config = self._load_config_from_s3(self.args['CONFIG_S3_PATH'])
         self.s3_client = boto3.client('s3')
-        self.redshift_client = boto3.client('redshift-data', region_name='us-east-1')
+        self.clusteridentifier = self.args['clusteridentifier']
+        self.redshiftdatabase = self.args['redshiftdatabase']
+        self.redshiftuser = self.args['redshiftuser']
+        self.redshiftsecret_arn = self.args['redshiftsecret_arn']
+        self.redshiftclient = boto3.client('redshift-data')
+        self.rds_secret_name = self.args.get("rds_secret_name")
+        self.redshift_url = self.args.get("redshift_url")
+        self.redshift_secret_name = self.args.get("redshift_secret_name")
 
     @staticmethod
     def _parse_args():
@@ -84,7 +115,8 @@ class NRTGlueJob:
                 'S3_BUCKET', 'MAIN_KEY', 'METADATA_KEY', 'CONFIG_S3_PATH',
                 'CURATED_TABLE', 'PUBLISHED_TABLE', 'FULL_CONFIG',
                 'database', 'env', 'resourcearn',
-                'schema', 'secretarn', 'sns_arn', 'KMS_ID', 'redshift_secret_name', 'rds_secret_name'
+                'schema', 'secretarn', 'sns_arn', 'KMS_ID', 'redshift_secret_name',
+                'redshiftsecret_arn', 'redshiftdatabase', 'clusteridentifier', 'redshiftuser', 'rds_secret_name', 'redshift_url'
             ]
         )
 
@@ -196,30 +228,29 @@ class NRTGlueJob:
         pandas_df = pandas_df.replace({np.nan: None, pd.NaT: None})
         return pandas_df
 
-    def _execute_redshift_sql(self, sql, cluster_id=None, database=None, db_user=None):
+    def _execute_redshift_sql(self, sql):
         """
-        Executes a SQL statement on Redshift using Redshift Data API.
+        Executes a SQL statement on Redshift using Redshift Data API and secret ARN.
         """
-        if cluster_id is None:
-            cluster_id = 'sc360-dev-redshiftcluster'
-        if database is None:
-            database = 'devdb'
-        if db_user is None:
-            db_user = 'arubauser'
-
-        response = self.redshift_client.execute_statement(
-            ClusterIdentifier=cluster_id,
-            Database=database,
-            DbUser=db_user,
-            Sql=sql
-        )
-        print(f"Executed SQL on Redshift:\n{sql}")
-        print(f"Redshift response: {response}")
-        return response
+        try:
+            response = self.redshiftclient.execute_statement(
+                ClusterIdentifier=self.clusteridentifier,
+                Database=self.redshiftdatabase,
+                SecretArn=self.redshiftsecret_arn,
+                Sql=sql,
+                WithEvent=True
+            )
+            print(f"Redshift SQL executed: {sql}")
+            print(f"Redshift response: {response}")
+            return response
+        except Exception as e:
+            print(f"Redshift SQL execution error: {e}")
+            raise
 
     def _write_to_redshift(self, spark_df, table_options):
         """
         Writes a Spark DataFrame to Redshift using AWS Glue DynamicFrame.
+        Auth is handled by Glue connection, so no user/password here.
         """
         sc = SparkContext.getOrCreate()
         glue_context = GlueContext(sc)
@@ -235,7 +266,6 @@ class NRTGlueJob:
         """
         Main entry point to execute the Glue job.
         """
-        # --- Log job parameters and configuration ---
         self.logger.info(f"Processing file: {self.args['MAIN_KEY']}")
         self.logger.info(f"Using curated table: {self.args['CURATED_TABLE']}")
         self.logger.info(f"Config S3 path: {self.args['CONFIG_S3_PATH']}")
@@ -258,7 +288,6 @@ class NRTGlueJob:
         all_data_keys, all_metadata_keys = self._list_s3_keys(landing_prefix)
         print(f"Listed S3 keys. Data files: {len(all_data_keys)}, Metadata files: {len(all_metadata_keys)}")
 
-        # --- File Validation ---
         validator = FileValidator(
             bucket=self.args['S3_BUCKET'],
             region=os.environ.get("AWS_REGION", "us-east-1"),
@@ -287,20 +316,16 @@ class NRTGlueJob:
 
             print("File validation PASSED.")
 
-            # --- Load Data as DataFrame ---
             pandas_df = self._load_pandas_df(decrypted_bytes, expected_extension, entity_config)
             print("Loaded file into pandas DataFrame.")
 
-            # --- Rename and Clean DataFrame ---
             column_type_map = entity_config.get("column_type_map", {})
             pandas_df = self._rename_and_clean_pandas_df(pandas_df, column_type_map)
             print("Renamed and cleaned pandas DataFrame.")
 
-            # --- Convert to Spark DataFrame ---
             spark_df = self.spark.createDataFrame(pandas_df)
             print("Converted pandas DataFrame to Spark DataFrame.")
 
-            # --- Data Validation ---
             self.logger.info("Starting data validation (DQ checks)...")
             dq_validator = DataValidator(
                 df=spark_df,
@@ -319,12 +344,10 @@ class NRTGlueJob:
 
             print("Data validation PASSED, continuing downstream processing.")
 
-            # --- Column Mapping ---
             column_mapping = entity_config.get("column_mapping", {})
             mapped_df = apply_column_mapping_with_withColumn(clean_df, column_mapping)
             print("Applied column mapping and transformations.")
 
-            # --- Hash Generation ---
             hash_columns = entity_config.get("hash_columns", [])
             hash_column_name = entity_config.get("hash_column_name", "record_hash")
             source_file_name = os.path.basename(file_key)
@@ -344,28 +367,26 @@ class NRTGlueJob:
                 self.logger.warning("No hash_columns defined in config; hash_code not generated.")
 
             # --- Truncate Redshift table for fresh load ---
-            cluster_id = 'sc360-dev-redshiftcluster'
-            database = 'devdb'
-            db_user = 'arubauser'
-            truncate_sql = 'TRUNCATE TABLE curated.CUR_REVENUE_EGI_NRT;'
+            curated_table = entity_config.get('curated_table', 'curated.CUR_REVENUE_EGI_NRT')
+            truncate_sql = f"TRUNCATE TABLE {curated_table};"
             self._execute_redshift_sql(truncate_sql)
-            print(f"Redshift table curated.CUR_REVENUE_EGI_NRT truncated successfully.")
-
-            # --- Write to Redshift curated table ---
+            print(f"Redshift table {curated_table} truncated successfully.")
+            
+            secret = get_redshift_secret(self.redshift_secret_name)
             redshift_options = {
-                "url": "jdbc:redshift://sc360-dev-redshiftcluster.cjjh5rkigghp.us-east-1.redshift.amazonaws.com:5439/devdb",
-                "user": "arubauser",
-                "password": "2020Sept01",
-                "dbtable": "curated.CUR_REVENUE_EGI_NRT",
+                "url": self.redshift_url,
+                "user": self.redshiftuser,
+                "password": secret["password"],
+                "dbtable": curated_table,
                 "redshiftTmpDir": "s3://sc360-dev-ww-nrt-bucket/staging/",
-                "mode": "overwrite"
+                "mode": "overwrite",
+                
             }
             self._write_to_redshift(final_df, redshift_options)
 
-            # --- SCD2 SQL Generation from Config ---
             hash_columns = entity_config.get("hash_columns", [])
             primary_keys = entity_config.get("primary_key_columns", [])
-            target_columns = entity_config.get("hash_columns", [])  # that's all you need!
+            target_columns = entity_config.get("hash_columns", [])
             target_table = entity_config.get("published_table", "published.r_revenue_egi_nrt")
             staging_table = entity_config.get("curated_table", "curated.CUR_REVENUE_EGI_NRT")
             hash_key = entity_config.get("hash_column_name", "record_hash")
@@ -383,11 +404,9 @@ class NRTGlueJob:
             print("--- SCD2 UPDATE SQL ---\n", update_sql)
             print("--- SCD2 INSERT SQL ---\n", insert_sql)
 
-            # --- Execute SCD2 UPDATE ---
             self._execute_redshift_sql(update_sql)
             print("SCD2 UPDATE executed successfully.")
 
-            # --- Execute SCD2 INSERT ---
             self._execute_redshift_sql(insert_sql)
             print("SCD2 INSERT executed successfully.")
 
