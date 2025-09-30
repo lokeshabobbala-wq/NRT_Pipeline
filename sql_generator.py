@@ -66,15 +66,15 @@ class SCD2SQLGenerator:
         )
 
         sql = f"""INSERT INTO {self.target_table} (
-    {insert_cols_str}
-)
-SELECT
-    {select_cols_str}
-FROM {self.staging_table} stg
-LEFT JOIN {self.target_table} tgt
-    ON {join_conditions}
-WHERE {where_clause};
-"""
+                    {insert_cols_str}
+                )
+                SELECT
+                    {select_cols_str}
+                FROM {self.staging_table} stg
+                LEFT JOIN {self.target_table} tgt
+                    ON {join_conditions}
+                WHERE {where_clause};
+                """
         return sql
 
     def generate_update_sql(self) -> str:
@@ -82,13 +82,13 @@ WHERE {where_clause};
             f'tgt.{_quote(col)} = stg.{_quote(col)}' for col in self.primary_key_columns
         ])
         sql = f"""UPDATE {self.target_table} tgt
-SET
-    "end_date" = GETDATE(),
-    "is_current_fg" = 'N'
-FROM {self.staging_table} stg
-WHERE
-    {key_conditions}
-    AND tgt."is_current_fg" = 'Y'
-    AND tgt."record_hash" <> stg."record_hash";
-"""
+                SET
+                    "end_date" = GETDATE(),
+                    "is_current_fg" = 'N'
+                FROM {self.staging_table} stg
+                WHERE
+                    {key_conditions}
+                    AND tgt."is_current_fg" = 'Y'
+                    AND tgt."record_hash" <> stg."record_hash";
+                """
         return sql
