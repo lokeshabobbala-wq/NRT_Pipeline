@@ -449,8 +449,8 @@ def main():
     Main function entry point.
     """
     job = NRTGlueJob()
-    print("Start")
-    #job.run()
+    job.run()
 
 if __name__ == "__main__":
     main()
+
