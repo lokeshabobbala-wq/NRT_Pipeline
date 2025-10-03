@@ -171,7 +171,7 @@ def check_main_file_exists(s3_client, bucket, main_filename, expected_extension)
             logger.error(f"Error checking main file in S3: {e}")
             raise
 
-def trigger_glue_job(bucket, main_key, metadata_key, config_file_s3_path, curated_table, published_table, full_config):
+def trigger_glue_job(bucket, main_key, metadata_key, config_file_s3_path, curated_table, published_table, full_config, base_filename):
     """
     Triggers the Glue job with S3 bucket, main file key, and metadata file key as arguments.
 
@@ -196,7 +196,8 @@ def trigger_glue_job(bucket, main_key, metadata_key, config_file_s3_path, curate
         '--CONFIG_S3_PATH': config_file_s3_path,
         '--CURATED_TABLE': curated_table,
         '--PUBLISHED_TABLE': published_table,
-        '--FULL_CONFIG': json.dumps(full_config, default=str)
+        '--FULL_CONFIG': json.dumps(full_config, default=str),
+        '--BASE_FILE_NAME': base_filename
     }
     response = glue.start_job_run(
         JobName=job_name,
@@ -325,7 +326,8 @@ def lambda_handler(event, context):
                 config_file_s3_path,
                 curated_table,
                 published_table,
-                full_config
+                full_config,
+                base_filename
             )
             logger.info(f"Glue job started for main file: {main_key}, metadata file: {metadata_key}, JobRunId: {job_run_id}")
         except Exception as glue_err:
