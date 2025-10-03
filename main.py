@@ -11,6 +11,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     concat_ws, sha2, col, lit, current_timestamp
 )
+from pyspark.sql import functions as F
 from pyspark.sql.types import TimestampType
 from awsglue.context import GlueContext
 from pyspark.context import SparkContext
@@ -365,7 +366,31 @@ class NRTGlueJob:
             else:
                 final_df = mapped_df
                 self.logger.warning("No hash_columns defined in config; hash_code not generated.")
-
+            
+            filtered_df = final_df.filter(
+                (final_df.order_type == 'ZSTO') &
+                (final_df.order_create_calendar_date == '2025-08-01') &
+                (final_df.sales_order_identifier == '7200414719') &
+                (final_df.sales_order_line_item_number == '000010') &
+                (final_df.source_type == 'S4 Orders') &
+                (final_df.shipment_date == '2025-08-07') &
+                (final_df.delivery_identifier == '0301161587')
+            )
+            
+            grouped_df = filtered_df.groupBy(
+                                                "order_type",
+                                                "order_create_calendar_date",
+                                                "sales_order_identifier",
+                                                "sales_order_line_item_number",
+                                                "source_type",
+                                                "shipment_date",
+                                                "delivery_identifier",
+                                                "process_timestamp"
+                                            ).agg(
+                                                F.count("*").alias("record_count")
+                                            )
+            grouped_df.show()
+            '''
             # --- Truncate Redshift table for fresh load ---
             curated_table = entity_config.get('curated_table', 'curated.CUR_REVENUE_EGI_NRT')
             truncate_sql = f"TRUNCATE TABLE {curated_table};"
@@ -403,15 +428,15 @@ class NRTGlueJob:
             insert_sql = sql_gen.generate_insert_sql()
             print("--- SCD2 UPDATE SQL ---\n", update_sql)
             print("--- SCD2 INSERT SQL ---\n", insert_sql)
-
+            
             self._execute_redshift_sql(update_sql)
             print("SCD2 UPDATE executed successfully.")
 
             self._execute_redshift_sql(insert_sql)
             print("SCD2 INSERT executed successfully.")
-
+            
             print("Glue job completed successfully.")
-
+            '''
         except Exception as exc:
             error_message = f"Exception during file or data validation: {str(exc)}"
             self.logger.error(error_message)
@@ -424,7 +449,8 @@ def main():
     Main function entry point.
     """
     job = NRTGlueJob()
-    job.run()
+    print("Start")
+    #job.run()
 
 if __name__ == "__main__":
     main()
