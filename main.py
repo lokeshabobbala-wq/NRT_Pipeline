@@ -8,10 +8,7 @@ import pandas as pd
 import numpy as np
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    concat_ws, sha2, col, lit, current_timestamp
-)
-from pyspark.sql import functions as F
+from pyspark.sql.functions import concat_ws, sha2, col, lit, current_timestamp
 from pyspark.sql.types import TimestampType
 from awsglue.context import GlueContext
 from pyspark.context import SparkContext
@@ -22,16 +19,16 @@ from file_validation import FileValidator
 from data_validation import DataValidator
 from sql_generator import SCD2SQLGenerator
 
-import boto3
 import ast
+import datetime
+from typing import Dict, Any, Optional, Tuple
 
 def get_redshift_secret(secret_name, region_name="us-east-1"):
     secrets_client = boto3.client('secretsmanager', region_name=region_name)
     response = secrets_client.get_secret_value(SecretId=secret_name)
     if response['ResponseMetadata']['HTTPStatusCode'] == 200:
-        print(f"Successfully retrieved credentials for {secret_name}")
         creds = ast.literal_eval(response['SecretString'])
-        dbname = creds.get("redshift_database") or creds.get("engine")  # Handle Redshift & RDS
+        dbname = creds.get("redshift_database") or creds.get("engine")
         port = creds.get("redshift_port") or creds.get("port")
         username = creds.get("redshift_username") or creds.get("username")
         password = creds.get("redshift_password") or creds.get("password")
@@ -46,10 +43,68 @@ def get_redshift_secret(secret_name, region_name="us-east-1"):
     else:
         raise Exception(f"Failed to retrieve credentials for {secret_name}")
 
+def insert_glue_audit_log_rdsdata(rds_client, resourceArn, secretArn, database, audit_data: dict):
+    """
+    Centralized audit log insert. Only pass changed variables in audit_data.
+    """
+    import datetime
+    logtimestamp = datetime.datetime.utcnow()
+
+    sql = """
+        INSERT INTO audit.sc360_audit_log_nrt_bkp (
+            batchid, batchrundate, regionname, datapipelinename, pipelinerunid, processname, filename,
+            sourceplatform, targetplatform, activity, environment, "interval", scriptpath,
+            executionstatus, errormessage, executionstarttime, executionendtime, executiondurationinseconds,
+            datareadsize, datawrittensize, landingcount, rawcount, rejectcount, previouscount, updatedcount,
+            insertedcount, totalcount, logtimestamp, jobid, clusterid, sourcename, destinationname,
+            expected_start_time, expected_end_time, freshness, data_refresh_mode
+        ) VALUES (
+            :batchid, :batchrundate::date, :regionname, :datapipelinename, :pipelinerunid, :processname, :filename,
+            :sourceplatform, :targetplatform, :activity, :environment, :interval, :scriptpath,
+            :executionstatus, :errormessage, :executionstarttime::timestamp, :executionendtime::timestamp, :executiondurationinseconds,
+            :datareadsize, :datawrittensize, :landingcount, :rawcount, :rejectcount, :previouscount, :updatedcount,
+            :insertedcount, :totalcount, :logtimestamp::timestamp, :jobid, :clusterid, :sourcename, :destinationname,
+            :expected_start_time::timestamp, :expected_end_time::timestamp, :freshness, :data_refresh_mode
+        )
+    """
+
+    all_fields = [
+        'batchid', 'batchrundate', 'regionname', 'datapipelinename', 'pipelinerunid',
+        'processname', 'filename', 'sourceplatform', 'targetplatform', 'activity',
+        'environment', 'interval', 'scriptpath', 'executionstatus', 'errormessage',
+        'executionstarttime', 'executionendtime', 'executiondurationinseconds', 'datareadsize',
+        'datawrittensize', 'landingcount', 'rawcount', 'rejectcount', 'previouscount',
+        'updatedcount', 'insertedcount', 'totalcount', 'logtimestamp', 'jobid', 'clusterid',
+        'sourcename', 'destinationname', 'expected_start_time', 'expected_end_time',
+        'freshness', 'data_refresh_mode'
+    ]
+
+    def _param(name, value):
+        # Only set type if required, otherwise string
+        if value is None:
+            return {'name': name, 'value': {'isNull': True}}
+        if isinstance(value, float):
+            return {'name': name, 'value': {'doubleValue': float(value)}}
+        if isinstance(value, int):
+            return {'name': name, 'value': {'longValue': int(value)}}
+        return {'name': name, 'value': {'stringValue': str(value)}}
+
+    params = [_param(field, audit_data.get(field)) for field in all_fields]
+
+    try:
+        response = rds_client.execute_statement(
+            resourceArn=resourceArn,
+            secretArn=secretArn,
+            database=database,
+            sql=sql,
+            parameters=params
+        )
+        print("RDS Data API Response:")
+        print(response)
+    except Exception as e:
+        print(f"Failed to insert Glue audit log via RDS Data API: {e}")
+
 def fiscal_quarter_from_date(date_val):
-    """
-    Derives fiscal quarter string from a date value.
-    """
     if not date_val:
         return None
     if isinstance(date_val, str):
@@ -64,9 +119,6 @@ def fiscal_quarter_from_date(date_val):
     return f"{y}-Q{q}"
 
 def apply_column_mapping_with_withColumn(df, mapping):
-    """
-    Applies column mapping and transformation to a Spark DataFrame.
-    """
     from pyspark.sql.functions import udf
     from pyspark.sql.types import StringType
 
@@ -86,9 +138,6 @@ def apply_column_mapping_with_withColumn(df, mapping):
     return mapped_df
 
 class NRTGlueJob:
-    """
-    Main class for NRT Glue job processing.
-    """
     def __init__(self):
         self.args = self._parse_args()
         self.spark = self._get_spark_session()
@@ -101,15 +150,18 @@ class NRTGlueJob:
         self.redshiftuser = self.args['redshiftuser']
         self.redshiftsecret_arn = self.args['redshiftsecret_arn']
         self.redshiftclient = boto3.client('redshift-data')
-        self.rds_secret_name = self.args.get("rds_secret_name")
+        self.rds_client = boto3.client('rds-data')
+        self.resourcearn = self.args['resourcearn']
+        self.secretarn = self.args['secretarn']
+        self.database = self.args['database']
         self.redshift_url = self.args.get("redshift_url")
         self.redshift_secret_name = self.args.get("redshift_secret_name")
 
+        # Audit context defaults
+        self.audit_context = self._default_audit_context()
+
     @staticmethod
     def _parse_args():
-        """
-        Parses AWS Glue job arguments.
-        """
         return getResolvedOptions(
             sys.argv,
             [
@@ -123,9 +175,6 @@ class NRTGlueJob:
 
     @staticmethod
     def _get_spark_session():
-        """
-        Initializes and returns a Spark session.
-        """
         spark = (
             SparkSession.builder
             .appName("DQ")
@@ -137,9 +186,6 @@ class NRTGlueJob:
         return spark
 
     def _get_logger(self):
-        """
-        Initializes and returns a logger.
-        """
         return Logging(
             spark_context=self.spark,
             app_name="NRT_PIPELINE",
@@ -147,25 +193,16 @@ class NRTGlueJob:
         )
 
     def _load_full_config(self):
-        """
-        Loads the full config JSON from the Glue argument.
-        """
         return json.loads(self.args['FULL_CONFIG'])
 
     @staticmethod
     def _load_config_from_s3(config_s3_path):
-        """
-        Loads the config JSON file from S3.
-        """
         s3 = boto3.client('s3')
         bucket, key = config_s3_path.replace("s3://", "").split("/", 1)
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj['Body'].read())
 
     def _send_notification(self, error_message):
-        """
-        Sends SNS notification in case of failure.
-        """
         try:
             sns = boto3.client('sns')
             sns.publish(
@@ -179,9 +216,6 @@ class NRTGlueJob:
             self.logger.error(traceback.format_exc())
 
     def _get_entity_config(self):
-        """
-        Determines the entity config key based on the filename.
-        """
         entity_name = os.path.splitext(os.path.basename(self.args['MAIN_KEY']))[0].split('_')[0]
         entity_config_key = None
         for k in self.config:
@@ -189,13 +223,10 @@ class NRTGlueJob:
                 entity_config_key = k
                 break
         if not entity_config_key:
-            entity_config_key = list(self.config.keys())[0]  # fallback to first key
+            entity_config_key = list(self.config.keys())[0]
         return self.config[entity_config_key]
 
     def _list_s3_keys(self, prefix):
-        """
-        Lists S3 objects for a given prefix.
-        """
         all_objects = self.s3_client.list_objects_v2(Bucket=self.args['S3_BUCKET'], Prefix=prefix)
         contents = all_objects.get('Contents', [])
         all_data_keys = [
@@ -209,9 +240,6 @@ class NRTGlueJob:
         return all_data_keys, all_metadata_keys
 
     def _load_pandas_df(self, decrypted_bytes, expected_extension, entity_config):
-        """
-        Loads a pandas DataFrame from raw bytes based on extension.
-        """
         if expected_extension.lower() == "csv":
             df = pd.read_csv(StringIO(decrypted_bytes.decode("utf-8")))
         elif expected_extension.lower() in ("xlsx", "xls"):
@@ -222,17 +250,11 @@ class NRTGlueJob:
         return df
 
     def _rename_and_clean_pandas_df(self, pandas_df, column_type_map):
-        """
-        Renames columns based on config and replaces null values.
-        """
         pandas_df.columns = list(column_type_map.keys())
         pandas_df = pandas_df.replace({np.nan: None, pd.NaT: None})
         return pandas_df
 
     def _execute_redshift_sql(self, sql):
-        """
-        Executes a SQL statement on Redshift using Redshift Data API and secret ARN.
-        """
         try:
             response = self.redshiftclient.execute_statement(
                 ClusterIdentifier=self.clusteridentifier,
@@ -249,10 +271,6 @@ class NRTGlueJob:
             raise
 
     def _write_to_redshift(self, spark_df, table_options):
-        """
-        Writes a Spark DataFrame to Redshift using AWS Glue DynamicFrame.
-        Auth is handled by Glue connection, so no user/password here.
-        """
         sc = SparkContext.getOrCreate()
         glue_context = GlueContext(sc)
         dyf = DynamicFrame.fromDF(spark_df, glue_context, "dyf_final")
@@ -263,140 +281,176 @@ class NRTGlueJob:
         )
         print("Data written to Redshift table successfully.")
 
-    def run(self):
-        """
-        Main entry point to execute the Glue job.
-        """
-        self.logger.info(f"Processing file: {self.args['MAIN_KEY']}")
-        self.logger.info(f"Using curated table: {self.args['CURATED_TABLE']}")
-        self.logger.info(f"Config S3 path: {self.args['CONFIG_S3_PATH']}")
-        self.logger.info(f"Metadata file: {self.args['METADATA_KEY']}")
-        self.logger.info(f"Environment: {self.args['env']}")
-        self.logger.info("--- FULL CONFIG FROM DATABASE ROW ---")
-        self.logger.info(json.dumps(self.full_config, indent=2))
-        self.logger.info("--- CONFIG FILE FROM S3 (FOR FILE TYPE) ---")
-        self.logger.info(json.dumps(self.config, indent=2))
+    def _default_audit_context(self) -> dict:
+        today = datetime.date.today()
+        main_file = os.path.basename(self.args['MAIN_KEY'])
+        main_file_no_ext = os.path.splitext(main_file)[0]
+        logical_file_name = main_file_no_ext.rsplit('_', 1)[0]
+        return {
+            "batchid": f"WW_Batch_{today.strftime('%Y%m%d')}",
+            "batchrundate": today,
+            "regionname": "WW",
+            "datapipelinename": "NRT_Glue_DataPipeline",
+            "pipelinerunid": self.args.get("JOB_RUN_ID") or os.environ.get("JOB_RUN_ID") or "",
+            "activity": "NRT_Data_Load",
+            "environment": self.args['env'],
+            "interval": "",
+            "scriptpath": os.path.abspath(__file__),
+            "jobid": self.args.get("JOB_RUN_ID")[:50] or os.environ.get("JOB_RUN_ID")[:50] or "",
+            "clusterid": self.clusteridentifier,
+            "freshness": None,
+            "logical_file_name": logical_file_name,
+            "filename": main_file,
+            "sourcename": main_file,
+            "destinationname": main_file,
+            "data_refresh_mode": "NRT"
+        }
 
-        entity_config = self._get_entity_config()
-        print("Entity config loaded and parsed.")
-
-        allowed_prefixes = entity_config.get("allowed_prefixes", [""])
-        expected_extension = entity_config.get("input_file_extension", "csv")
-        rds_secret_name = self.args['secretarn']
-        kms_id = self.args['KMS_ID']
-
-        landing_prefix = os.path.dirname(self.args['MAIN_KEY'])
-        all_data_keys, all_metadata_keys = self._list_s3_keys(landing_prefix)
-        print(f"Listed S3 keys. Data files: {len(all_data_keys)}, Metadata files: {len(all_metadata_keys)}")
-
-        validator = FileValidator(
-            bucket=self.args['S3_BUCKET'],
-            region=os.environ.get("AWS_REGION", "us-east-1"),
-            logger=self.logger,
-            allowed_prefixes=allowed_prefixes,
-            rds_secret_name=rds_secret_name,
-            expected_extension=expected_extension,
-            kms_id=kms_id
-        )
-
-        file_key = self.args['MAIN_KEY']
-        metadata_key = self.args['METADATA_KEY']
-
+    def file_validation(self, entity_config, audit) -> dict:
+        """File validation step."""
+        result = {"executionstatus": "Success", "errormessage": None}
         try:
-            self.logger.info("Starting file validation...")
+            allowed_prefixes = entity_config.get("allowed_prefixes", [""])
+            expected_extension = entity_config.get("input_file_extension", "csv")
+            rds_secret_name = self.args['secretarn']
+            kms_id = self.args['KMS_ID']
+
+            landing_prefix = os.path.dirname(self.args['MAIN_KEY'])
+            all_data_keys, all_metadata_keys = self._list_s3_keys(landing_prefix)
+
+            validator = FileValidator(
+                bucket=self.args['S3_BUCKET'],
+                region=audit["regionname"],
+                logger=self.logger,
+                allowed_prefixes=allowed_prefixes,
+                rds_secret_name=rds_secret_name,
+                expected_extension=expected_extension,
+                kms_id=kms_id
+            )
+
+            file_key = self.args['MAIN_KEY']
+            metadata_key = self.args['METADATA_KEY']
+
+            start_time = datetime.datetime.utcnow()
             valid, decrypted_bytes = validator.validate_file(
                 file_key, metadata_key, entity_config,
                 all_data_keys=all_data_keys, all_metadata_keys=all_metadata_keys
             )
+            read_size = validator.s3.head_object(Bucket=self.args['S3_BUCKET'], Key=file_key)['ContentLength'] if validator.s3 and file_key else None
+
             if not valid:
-                self.logger.error("File validation FAILED.")
-                error_message = f"File validation failed for {file_key}. See log for details."
-                self._send_notification(error_message)
-                print("File validation failed. Notification sent. Exiting job.")
-                return
+                result.update({
+                    "executionstatus": "Failed",
+                    "errormessage": f"File validation failed for {file_key}. See log for details."
+                })
+                self._send_notification(result["errormessage"])
+                decrypted_bytes = None
+            end_time = datetime.datetime.utcnow()
+            result.update({
+                "executionstarttime": start_time,
+                "executionendtime": end_time,
+                "executiondurationinseconds": (end_time - start_time).total_seconds(),
+                "datareadsize": read_size,
+                "datawrittensize": read_size,
+                "decrypted_bytes": decrypted_bytes
+            })
+            return result
+        except Exception as e:
+            end_time = datetime.datetime.utcnow()
+            return {
+                "executionstatus": "Failed",
+                "errormessage": f"Exception during file validation: {e}",
+                "executionstarttime": None,
+                "executionendtime": end_time,
+                "executiondurationinseconds": None,
+                "datareadsize": None,
+                "datawrittensize": None,
+                "decrypted_bytes": None
+            }
 
-            print("File validation PASSED.")
-
-            pandas_df = self._load_pandas_df(decrypted_bytes, expected_extension, entity_config)
-            print("Loaded file into pandas DataFrame.")
-
-            column_type_map = entity_config.get("column_type_map", {})
-            pandas_df = self._rename_and_clean_pandas_df(pandas_df, column_type_map)
-            print("Renamed and cleaned pandas DataFrame.")
-
+    def data_validation(self, entity_config, audit, decrypted_bytes) -> dict:
+        """Data validation step."""
+        result = {"executionstatus": "Success", "errormessage": None}
+        try:
+            start_time = datetime.datetime.utcnow()
+            pandas_df = self._load_pandas_df(decrypted_bytes, entity_config.get("input_file_extension", "csv"), entity_config)
+            pandas_df = self._rename_and_clean_pandas_df(pandas_df, entity_config.get("column_type_map", {}))
             spark_df = self.spark.createDataFrame(pandas_df)
-            print("Converted pandas DataFrame to Spark DataFrame.")
 
-            self.logger.info("Starting data validation (DQ checks)...")
+            landing_count = pandas_df.shape[0]
             dq_validator = DataValidator(
                 df=spark_df,
                 config=entity_config,
                 logger=self.logger,
-                file_name=os.path.basename(file_key)
+                file_name=audit["filename"]
             )
             clean_df = dq_validator.run_all_checks()
             audit_info = dq_validator.get_audit_info()
 
             if clean_df is None:
-                self.logger.error(f"File rejected during data validation: {audit_info}")
-                self._send_notification(f"File rejected during DQ: {audit_info}")
-                print("Data validation failed. Notification sent. Exiting job.")
-                return
-
-            print("Data validation PASSED, continuing downstream processing.")
-
-            column_mapping = entity_config.get("column_mapping", {})
-            mapped_df = apply_column_mapping_with_withColumn(clean_df, column_mapping)
-            print("Applied column mapping and transformations.")
-
-            hash_columns = entity_config.get("hash_columns", [])
-            hash_column_name = entity_config.get("hash_column_name", "record_hash")
-            source_file_name = os.path.basename(file_key)
-            if hash_columns:
-                final_df = (
-                    mapped_df
-                    .withColumn(hash_column_name, sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256))
-                    .withColumn("source_file_name", lit(source_file_name))
-                    .withColumn("batch_run_dt", lit(current_timestamp()).cast(TimestampType()))
-                    .withColumn("created_by", lit("glue"))
-                    .withColumn("create_dt", lit(current_timestamp()).cast(TimestampType()))
-                    .withColumn("source_nm", lit("sc360-dev-nrt-dataload-processor"))
-                )
-                print(f"Hash column '{hash_column_name}' generated using columns {hash_columns}.")
+                result.update({
+                    "executionstatus": "Failed",
+                    "errormessage": f"File rejected during data validation: {audit_info}",
+                    "landingcount": landing_count,
+                    "rawcount": None,
+                    "rejectcount": landing_count
+                })
+                self._send_notification(result["errormessage"])
+                end_time = datetime.datetime.utcnow()
             else:
-                final_df = mapped_df
-                self.logger.warning("No hash_columns defined in config; hash_code not generated.")
-            
-            filtered_df = final_df.filter(
-                (final_df.order_type == 'ZSTO') &
-                (final_df.order_create_calendar_date == '2025-08-01') &
-                (final_df.sales_order_identifier == '7200414719') &
-                (final_df.sales_order_line_item_number == '000010') &
-                (final_df.source_type == 'S4 Orders') &
-                (final_df.shipment_date == '2025-08-07') &
-                (final_df.delivery_identifier == '0301161587')
+                raw_count = clean_df.count()
+                reject_count = landing_count - raw_count
+                end_time = datetime.datetime.utcnow()
+                result.update({
+                    "landingcount": landing_count,
+                    "rawcount": raw_count,
+                    "rejectcount": reject_count,
+                    "final_df": self._map_columns(entity_config, clean_df, audit)
+                })
+            result.update({
+                "executionstarttime": start_time,
+                "executionendtime": end_time,
+                "executiondurationinseconds": (end_time - start_time).total_seconds()
+            })
+            return result
+        except Exception as e:
+            end_time = datetime.datetime.utcnow()
+            return {
+                "executionstatus": "Failed",
+                "errormessage": f"Exception during data validation: {e}",
+                "executionstarttime": None,
+                "executionendtime": end_time,
+                "executiondurationinseconds": None
+            }
+
+    def _map_columns(self, entity_config, clean_df, audit):
+        """Apply column mapping and record hash columns."""
+        column_mapping = entity_config.get("column_mapping", {})
+        mapped_df = apply_column_mapping_with_withColumn(clean_df, column_mapping)
+        hash_columns = entity_config.get("hash_columns", [])
+        hash_column_name = entity_config.get("hash_column_name", "record_hash")
+        source_file_name = audit["filename"]
+        if hash_columns:
+            return (
+                mapped_df
+                .withColumn(hash_column_name, sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256))
+                .withColumn("source_file_name", lit(source_file_name))
+                .withColumn("batch_run_dt", lit(current_timestamp()).cast(TimestampType()))
+                .withColumn("created_by", lit("glue"))
+                .withColumn("create_dt", lit(current_timestamp()).cast(TimestampType()))
+                .withColumn("source_nm", lit("sc360-dev-nrt-dataload-processor"))
             )
-            
-            grouped_df = filtered_df.groupBy(
-                                                "order_type",
-                                                "order_create_calendar_date",
-                                                "sales_order_identifier",
-                                                "sales_order_line_item_number",
-                                                "source_type",
-                                                "shipment_date",
-                                                "delivery_identifier",
-                                                "process_timestamp"
-                                            ).agg(
-                                                F.count("*").alias("record_count")
-                                            )
-            grouped_df.show()
-            '''
-            # --- Truncate Redshift table for fresh load ---
+        else:
+            self.logger.warning("No hash_columns defined in config; hash_code not generated.")
+            return mapped_df
+
+    def load_curated_to_redshift(self, entity_config, audit, final_df) -> dict:
+        """Load curated data to Redshift."""
+        result = {"executionstatus": "Success", "errormessage": None}
+        try:
+            start_time = datetime.datetime.utcnow()
             curated_table = entity_config.get('curated_table', 'curated.CUR_REVENUE_EGI_NRT')
-            truncate_sql = f"TRUNCATE TABLE {curated_table};"
-            self._execute_redshift_sql(truncate_sql)
-            print(f"Redshift table {curated_table} truncated successfully.")
-            
+            self._execute_redshift_sql(f"TRUNCATE TABLE {curated_table};")
             secret = get_redshift_secret(self.redshift_secret_name)
             redshift_options = {
                 "url": self.redshift_url,
@@ -405,17 +459,36 @@ class NRTGlueJob:
                 "dbtable": curated_table,
                 "redshiftTmpDir": "s3://sc360-dev-ww-nrt-bucket/staging/",
                 "mode": "overwrite",
-                
             }
             self._write_to_redshift(final_df, redshift_options)
+            total_count = final_df.count()
+            end_time = datetime.datetime.utcnow()
+            result.update({
+                "executionstarttime": start_time,
+                "executionendtime": end_time,
+                "executiondurationinseconds": (end_time - start_time).total_seconds(),
+                "totalcount": total_count
+            })
+            return result
+        except Exception as e:
+            end_time = datetime.datetime.utcnow()
+            return {
+                "executionstatus": "Failed",
+                "errormessage": f"Exception during curated Redshift load: {e}",
+                "executionstarttime": None,
+                "executionendtime": end_time,
+                "executiondurationinseconds": None
+            }
 
+    def load_published_to_redshift(self, entity_config, audit) -> dict:
+        """Load published data to Redshift, run SCD2 SQL."""
+        result = {"executionstatus": "Success", "errormessage": None}
+        try:
+            start_time = datetime.datetime.utcnow()
             hash_columns = entity_config.get("hash_columns", [])
             primary_keys = entity_config.get("primary_key_columns", [])
-            target_columns = entity_config.get("hash_columns", [])
             target_table = entity_config.get("published_table", "published.r_revenue_egi_nrt")
             staging_table = entity_config.get("curated_table", "curated.CUR_REVENUE_EGI_NRT")
-            hash_key = entity_config.get("hash_column_name", "record_hash")
-
             sql_gen = SCD2SQLGenerator(
                 target_table=target_table,
                 staging_table=staging_table,
@@ -423,34 +496,114 @@ class NRTGlueJob:
                 hash_columns=hash_columns,
                 surrogate_key="r_revenue_egi_nrt_id"
             )
+            self._execute_redshift_sql(sql_gen.generate_update_sql())
+            self._execute_redshift_sql(sql_gen.generate_insert_sql())
+            # published_total_count = ... (optional: fetch count from Redshift)
+            end_time = datetime.datetime.utcnow()
+            result.update({
+                "executionstarttime": start_time,
+                "executionendtime": end_time,
+                "executiondurationinseconds": (end_time - start_time).total_seconds()
+                # 'totalcount' can be added here if you run a SELECT COUNT(*)
+            })
+            return result
+        except Exception as e:
+            end_time = datetime.datetime.utcnow()
+            return {
+                "executionstatus": "Failed",
+                "errormessage": f"Exception during published Redshift load: {e}",
+                "executionstarttime": None,
+                "executionendtime": end_time,
+                "executiondurationinseconds": None
+            }
 
-            update_sql = sql_gen.generate_update_sql()
-            insert_sql = sql_gen.generate_insert_sql()
-            print("--- SCD2 UPDATE SQL ---\n", update_sql)
-            print("--- SCD2 INSERT SQL ---\n", insert_sql)
+    def audit_log(self, audit, process_name):
+        """Centralized audit log call."""
+        audit["processname"] = process_name
+        insert_glue_audit_log_rdsdata(
+            self.rds_client, self.resourcearn, self.secretarn, self.database, audit
+        )
+        
+    def archive_and_cleanup_s3_files(self, main_filename: str, metadata_filename: str):
+        """
+        Archives and deletes the provided main and metadata file from LandingZone to ArchiveZone, partitioned by date and logical name.
+        Handles exceptions and logs any errors.
+        """
+        s3 = self.s3_client
+        bucket = self.args['S3_BUCKET']
+        landing_prefix = "LandingZone/"
+        archive_prefix = "ArchiveZone/"
+        today = datetime.date.today()
+        dt_str = today.strftime("dt=%Y/%m/%d")
+        logical_name = main_filename.rsplit('_', 1)[0]
+    
+        for filename in [main_filename, metadata_filename]:
+            landing_key = os.path.join(landing_prefix, filename)
+            archive_key = f"{archive_prefix}{dt_str}/{logical_name}/{filename}"
+            try:
+                # Copy to archive
+                s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': landing_key}, Key=archive_key)
+                self.logger.info(f"Copied {landing_key} to {archive_key} in archive.")
+            except Exception as e:
+                self.logger.error(f"Failed to archive {landing_key} to {archive_key}: {e}")
+                continue  # Optionally, you can choose to exit or raise here
+    
+            try:
+                # Delete from landing
+                s3.delete_object(Bucket=bucket, Key=landing_key)
+                self.logger.info(f"Deleted {landing_key} from landing.")
+            except Exception as e:
+                self.logger.error(f"Failed to delete {landing_key} from landing after archiving: {e}")
+                
+    def main(self):
+        entity_config = self._get_entity_config()
+        audit = self.audit_context.copy()
+        try:
+            # Step 1: File Validation
+            file_val_result = self.file_validation(entity_config, audit)
+            audit.update(file_val_result)
+            self.audit_log(audit, "FileValidation")
+            if audit['executionstatus'] == "Failed":
+                return
+    
+            # Step 2: Data Validation
+            data_val_result = self.data_validation(entity_config, audit, file_val_result["decrypted_bytes"])
+            audit.update(data_val_result)
+            self.audit_log(audit, "DataValidation")
+            if audit['executionstatus'] == "Failed":
+                return
+    
+            # Step 3: Redshift Curated Load
+            curated_result = self.load_curated_to_redshift(entity_config, audit, data_val_result["final_df"])
+            audit.update(curated_result)
+            self.audit_log(audit, "RedshiftCuratedLoad")
+            if audit['executionstatus'] == "Failed":
+                return
+    
+            # Step 4: Redshift Published Load
+            published_result = self.load_published_to_redshift(entity_config, audit)
+            audit.update(published_result)
+            self.audit_log(audit, "RedshiftPublishedLoad")
+            if audit['executionstatus'] == "Failed":
+                return
             
-            self._execute_redshift_sql(update_sql)
-            print("SCD2 UPDATE executed successfully.")
-
-            self._execute_redshift_sql(insert_sql)
-            print("SCD2 INSERT executed successfully.")
-            
-            print("Glue job completed successfully.")
-            '''
+            # After all steps and audit logs
+            main_filename = os.path.basename(self.args['MAIN_KEY'])
+            metadata_filename = os.path.basename(self.args['METADATA_KEY'])
+            #self.archive_and_cleanup_s3_files(main_filename, metadata_filename)
+            print("Glue job completed successfully, and files archived and cleaned up.")
+    
         except Exception as exc:
-            error_message = f"Exception during file or data validation: {str(exc)}"
+            error_message = f"Exception during Glue job: {str(exc)}"
             self.logger.error(error_message)
             self.logger.error(traceback.format_exc())
             self._send_notification(error_message)
-            print("Exception caught; failure handled and notification sent.")
-
-def main():
-    """
-    Main function entry point.
-    """
-    job = NRTGlueJob()
-    job.run()
+            audit.update({
+                "executionstatus": "Failed",
+                "errormessage": error_message
+            })
+            self.audit_log(audit, "Failure")
 
 if __name__ == "__main__":
-    main()
-
+    job = NRTGlueJob()
+    job.main()
