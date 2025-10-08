@@ -94,3 +94,44 @@ class SCD2SQLGenerator:
                     AND tgt."process_timestamp" <> stg."process_timestamp";
                 """
         return sql
+        
+        
+class SNAPSHOTSQLGenerator:
+    def __init__(self, target_table: str, staging_table: str, primary_key_columns: list):
+        self.target_table = target_table
+        self.staging_table = staging_table
+        self.primary_key_columns = primary_key_columns
+
+    def _pk_join_condition(self, tgt_alias="tgt", stg_alias="stg"):
+        # All business keys are string
+        return "\n    AND ".join([
+            f'COALESCE(TRIM({tgt_alias}.{_quote(col)}), \'\') = COALESCE(TRIM({stg_alias}.{_quote(col)}), \'\')'
+            for col in self.primary_key_columns
+        ])
+
+    def generate_update_sql(self) -> str:
+        """
+        Set active_flag = 'N' for all records in published table.
+        You may restrict this to a subset if needed.
+        """
+        sql = f"""UPDATE {self.target_table}
+                SET active_flag = 'N'
+                WHERE active_flag = 'Y';
+                """
+        return sql
+
+    def generate_insert_sql(self) -> str:
+        """
+        Insert all records from curated table to published table with active_flag = 'Y'.
+        All columns from curated table are inserted except active_flag which is set to 'Y'.
+        """
+        # You may want to fetch columns dynamically; for simplicity, using *.
+        # If you need to specify, pass columns in constructor and build a list.
+        sql = f"""INSERT INTO {self.target_table} (
+                    SELECT
+                        stg.*,
+                        'Y' AS active_flag
+                    FROM {self.staging_table} AS stg
+                );
+                """
+        return sql
