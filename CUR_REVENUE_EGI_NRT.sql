@@ -4,7 +4,7 @@ DROP TABLE IF EXISTS curated.CUR_REVENUE_EGI_NRT;
 -- CREATE TABLE statement with all requested columns
 CREATE TABLE IF NOT EXISTS curated.CUR_REVENUE_EGI_NRT
 (
-    r_revenue_egi_nrt_id                     VARCHAR(100)   ENCODE lzo,
+    cp_backlog_sni_revenue                     VARCHAR(100)   ENCODE lzo,
     final_rtm                                VARCHAR(100)   ENCODE lzo,
     region                                   VARCHAR(100)   ENCODE lzo,
     customer_po_number                       VARCHAR(500)   ENCODE lzo,
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS curated.CUR_REVENUE_EGI_NRT
     "sum_of_cp_enterprise_standard_cost_(usd)" NUMERIC(30,15) ENCODE az64,
     "sum_of_cp_factory_margin_(usd)"          NUMERIC(30,15) ENCODE az64,
     "sum_of_cp_gross_margin_(usd)"             NUMERIC(30,15) ENCODE az64,
-    eg_net_revenue                           NUMERIC(30,15) ENCODE az64,
+    ,"sum_of_cp_gross_revenue_(usd)"           NUMERIC(30,15) ENCODE az64,
     "sum_of_cp_total_cost_of_sales_(usd)"      NUMERIC(30,15) ENCODE az64,
     sum_of_cp_unit_quantity                  NUMERIC(30,15) ENCODE az64,
     "sum_of_gross_revenue_(usd)"               NUMERIC(30,15) ENCODE az64,
