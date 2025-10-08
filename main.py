@@ -9,6 +9,7 @@ import numpy as np
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import concat_ws, sha2, col, lit, current_timestamp
+from pyspark.sql import functions as F
 from pyspark.sql.types import TimestampType
 from awsglue.context import GlueContext
 from pyspark.context import SparkContext
@@ -17,7 +18,8 @@ from awsglue.dynamicframe import DynamicFrame
 from logging_util import Logging
 from file_validation import FileValidator
 from data_validation import DataValidator
-from sql_generator import SCD2SQLGenerator
+from sql_generator import SCD2SQLGenerator, SNAPSHOTSQLGenerator
+from custom_utility_module import deduplicate_egi_2_0_inc
 
 import ast
 import datetime
@@ -280,12 +282,21 @@ class NRTGlueJob:
             connection_options=table_options
         )
         print("Data written to Redshift table successfully.")
-
-    def _default_audit_context(self) -> dict:
-        today = datetime.date.today()
-        main_file = os.path.basename(self.args['MAIN_KEY'])
+        
+    @staticmethod
+    def extract_file_info(main_key):
+        """
+        Extracts file details from a given S3 key or file path.
+        Returns: main_file, main_file_no_ext, logical_file_name
+        """
+        main_file = os.path.basename(main_key)
         main_file_no_ext = os.path.splitext(main_file)[0]
         logical_file_name = main_file_no_ext.rsplit('_', 1)[0]
+        return main_file, main_file_no_ext, logical_file_name
+        
+    def _default_audit_context(self) -> dict:
+        today = datetime.date.today()
+        main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
         return {
             "batchid": f"WW_Batch_{today.strftime('%Y%m%d')}",
             "batchrundate": today,
@@ -305,7 +316,7 @@ class NRTGlueJob:
             "destinationname": main_file,
             "data_refresh_mode": "NRT"
         }
-
+    
     def file_validation(self, entity_config, audit) -> dict:
         """File validation step."""
         result = {"executionstatus": "Success", "errormessage": None}
@@ -385,6 +396,13 @@ class NRTGlueJob:
                 file_name=audit["filename"]
             )
             clean_df = dq_validator.run_all_checks()
+
+            main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
+            self.logger.info(f"Row count before deduplication for {logical_file_name}: {clean_df.count()}")
+            if logical_file_name == "EGI_2_0_INC":
+                clean_df = deduplicate_egi_2_0_inc(clean_df)
+                self.logger.info(f"Row count after deduplication for {logical_file_name}: {clean_df.count()}")
+                
             audit_info = dq_validator.get_audit_info()
 
             if clean_df is None:
@@ -452,12 +470,14 @@ class NRTGlueJob:
             curated_table = entity_config.get('curated_table', 'curated.CUR_REVENUE_EGI_NRT')
             self._execute_redshift_sql(f"TRUNCATE TABLE {curated_table};")
             secret = get_redshift_secret(self.redshift_secret_name)
+            main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
+            today_date_str = datetime.date.today().strftime('%Y-%m-%d')
             redshift_options = {
                 "url": self.redshift_url,
                 "user": self.redshiftuser,
                 "password": secret["password"],
                 "dbtable": curated_table,
-                "redshiftTmpDir": "s3://sc360-dev-ww-nrt-bucket/staging/",
+                "redshiftTmpDir": f"s3://sc360-dev-ww-nrt-bucket/staging/dt={today_date_str}/{logical_file_name}/{main_file_no_ext}/",
                 "mode": "overwrite",
             }
             self._write_to_redshift(final_df, redshift_options)
@@ -481,30 +501,44 @@ class NRTGlueJob:
             }
 
     def load_published_to_redshift(self, entity_config, audit) -> dict:
-        """Load published data to Redshift, run SCD2 SQL."""
+        """
+        Load published data to Redshift according to load_type (scd2 or snapshot).
+        """
         result = {"executionstatus": "Success", "errormessage": None}
         try:
             start_time = datetime.datetime.utcnow()
+            load_type = entity_config.get("load_type", "scd2").lower()  # <--- READ load_type HERE
             hash_columns = entity_config.get("hash_columns", [])
             primary_keys = entity_config.get("primary_key_columns", [])
             target_table = entity_config.get("published_table", "published.r_revenue_egi_nrt")
             staging_table = entity_config.get("curated_table", "curated.CUR_REVENUE_EGI_NRT")
-            sql_gen = SCD2SQLGenerator(
-                target_table=target_table,
-                staging_table=staging_table,
-                primary_key_columns=primary_keys,
-                hash_columns=hash_columns,
-                surrogate_key="r_revenue_egi_nrt_id"
-            )
-            self._execute_redshift_sql(sql_gen.generate_update_sql())
-            self._execute_redshift_sql(sql_gen.generate_insert_sql())
-            # published_total_count = ... (optional: fetch count from Redshift)
+            
+            if load_type == "scd2":
+                sql_gen = SCD2SQLGenerator(
+                    target_table=target_table,
+                    staging_table=staging_table,
+                    primary_key_columns=primary_keys,
+                    hash_columns=hash_columns,
+                    surrogate_key="r_revenue_egi_nrt_id"
+                )
+                self._execute_redshift_sql(sql_gen.generate_update_sql())
+                self._execute_redshift_sql(sql_gen.generate_insert_sql())
+            elif load_type == "snapshot":
+                sql_gen = SNAPSHOTSQLGenerator(
+                    target_table=target_table,
+                    staging_table=staging_table,
+                    primary_key_columns=primary_keys,
+                )
+                self._execute_redshift_sql(sql_gen.generate_update_sql())
+                self._execute_redshift_sql(sql_gen.generate_insert_sql())
+            else:
+                raise Exception(f"Unknown load_type: {load_type}")
+    
             end_time = datetime.datetime.utcnow()
             result.update({
                 "executionstarttime": start_time,
                 "executionendtime": end_time,
                 "executiondurationinseconds": (end_time - start_time).total_seconds()
-                # 'totalcount' can be added here if you run a SELECT COUNT(*)
             })
             return result
         except Exception as e:
@@ -520,6 +554,13 @@ class NRTGlueJob:
     def audit_log(self, audit, process_name):
         """Centralized audit log call."""
         audit["processname"] = process_name
+    
+        # Truncate error_message to 2000 characters if present
+        if "errormessage" in audit and audit["errormessage"]:
+            audit["errormessage"] = str(audit["errormessage"])[:2000]
+            # Print error to application log
+            self.logger.error(f"AUDIT ERROR ({process_name}): {audit['errormessage']}")
+    
         insert_glue_audit_log_rdsdata(
             self.rds_client, self.resourcearn, self.secretarn, self.database, audit
         )
@@ -534,7 +575,7 @@ class NRTGlueJob:
         landing_prefix = "LandingZone/"
         archive_prefix = "ArchiveZone/"
         today = datetime.date.today()
-        dt_str = today.strftime("dt=%Y/%m/%d")
+        dt_str = today.strftime("dt=%Y-%m-%d")
         logical_name = main_filename.rsplit('_', 1)[0]
     
         for filename in [main_filename, metadata_filename]:
@@ -572,14 +613,14 @@ class NRTGlueJob:
             self.audit_log(audit, "DataValidation")
             if audit['executionstatus'] == "Failed":
                 return
-    
+            
             # Step 3: Redshift Curated Load
             curated_result = self.load_curated_to_redshift(entity_config, audit, data_val_result["final_df"])
             audit.update(curated_result)
             self.audit_log(audit, "RedshiftCuratedLoad")
             if audit['executionstatus'] == "Failed":
                 return
-    
+            
             # Step 4: Redshift Published Load
             published_result = self.load_published_to_redshift(entity_config, audit)
             audit.update(published_result)
@@ -590,9 +631,9 @@ class NRTGlueJob:
             # After all steps and audit logs
             main_filename = os.path.basename(self.args['MAIN_KEY'])
             metadata_filename = os.path.basename(self.args['METADATA_KEY'])
-            #self.archive_and_cleanup_s3_files(main_filename, metadata_filename)
+            self.archive_and_cleanup_s3_files(main_filename, metadata_filename)
             print("Glue job completed successfully, and files archived and cleaned up.")
-    
+            
         except Exception as exc:
             error_message = f"Exception during Glue job: {str(exc)}"
             self.logger.error(error_message)
