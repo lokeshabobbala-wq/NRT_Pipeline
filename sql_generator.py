@@ -3,6 +3,9 @@ def _quote(col):
         return col
     return f'"{col}"'
 
+def _coalesce_trim(col_alias, col_name, default="''"):
+    return f"COALESCE(TRIM({col_alias}.{_quote(col_name)}), {default})"
+
 class SCD2SQLGenerator:
     SCD2_AUDIT_DEFAULTS = [
         ("record_hash", lambda: 'stg."record_hash"'),
@@ -42,6 +45,13 @@ class SCD2SQLGenerator:
         if self.surrogate_key and self.surrogate_key in self.final_columns:
             self.final_columns.remove(self.surrogate_key)
 
+    def _pk_join_condition(self, tgt_alias="tgt", stg_alias="stg"):
+        # Use COALESCE(TRIM(...),'') for all keys (customize default for date columns if needed)
+        return "\n    AND ".join([
+            f"{_coalesce_trim(tgt_alias, col)} = {_coalesce_trim(stg_alias, col)}"
+            for col in self.primary_key_columns
+        ])
+
     def generate_insert_sql(self) -> str:
         insert_cols_str = ",\n    ".join([_quote(col) for col in self.final_columns])
         select_exprs = []
@@ -56,13 +66,10 @@ class SCD2SQLGenerator:
                 select_exprs.append(f'stg.{_quote(col)}')
         select_cols_str = ",\n    ".join(select_exprs)
 
-        join_conditions = "\n    AND ".join([
-            f'tgt.{_quote(col)} = stg.{_quote(col)}' for col in self.primary_key_columns
-        ])
-        join_conditions += "\n    AND tgt.\"is_current_fg\" = 'Y'"
+        join_conditions = self._pk_join_condition("tgt", "stg") + "\n    AND tgt.\"is_current_fg\" = 'Y'"
 
         where_clause = (
-            f'tgt.{_quote(self.surrogate_key)} IS NULL OR tgt.\"record_hash\" <> stg.\"record_hash\"'
+            f'tgt.{_quote(self.surrogate_key)} IS NULL OR tgt."record_hash" <> stg."record_hash"'
         )
 
         sql = f"""INSERT INTO {self.target_table} (
@@ -78,9 +85,7 @@ class SCD2SQLGenerator:
         return sql
 
     def generate_update_sql(self) -> str:
-        key_conditions = "\n    AND ".join([
-            f'tgt.{_quote(col)} = stg.{_quote(col)}' for col in self.primary_key_columns
-        ])
+        key_conditions = self._pk_join_condition()
         sql = f"""UPDATE {self.target_table} tgt
                 SET
                     "end_date" = GETDATE(),
