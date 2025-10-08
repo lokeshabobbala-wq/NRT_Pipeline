@@ -282,8 +282,6 @@ CREATE TABLE IF NOT EXISTS published.dly_cust_flflm_bcklg_snapshot_nrt
 	,rptg_prod_fmly VARCHAR(200)   ENCODE lzo
 	,prod_lc_stts VARCHAR(50)   ENCODE lzo
 	,opty_id VARCHAR(50)   ENCODE lzo
-	,rptg_bs_prod VARCHAR(50)   ENCODE lzo
-	,bs_prod VARCHAR(50)   ENCODE lzo
 	,rptg_hld_flg VARCHAR(2)   ENCODE lzo
 	,rptg_hld_cd VARCHAR(10)   ENCODE lzo
 	,rptg_hld_cgy VARCHAR(100)   ENCODE lzo
@@ -303,6 +301,8 @@ CREATE TABLE IF NOT EXISTS published.dly_cust_flflm_bcklg_snapshot_nrt
 	,rte_dys SMALLINT   ENCODE az64
 	,futr_cgy VARCHAR(10)   ENCODE lzo
 	,drvd_cust_rqstd_shp_dt DATE   ENCODE az64
+	,rptg_bs_prod VARCHAR(50)   ENCODE lzo
+	,bs_prod VARCHAR(50)   ENCODE lzo
 )
 DISTSTYLE AUTO
  SORTKEY (
