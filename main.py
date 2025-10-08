@@ -1,5 +1,6 @@
 import sys
 import os
+import io
 import json
 import boto3
 import traceback
@@ -19,7 +20,7 @@ from logging_util import Logging
 from file_validation import FileValidator
 from data_validation import DataValidator
 from sql_generator import SCD2SQLGenerator, SNAPSHOTSQLGenerator
-from custom_utility_module import deduplicate_egi_2_0_inc
+from custom_utility_module import process_by_logical_file_name
 
 import ast
 import datetime
@@ -243,7 +244,27 @@ class NRTGlueJob:
 
     def _load_pandas_df(self, decrypted_bytes, expected_extension, entity_config):
         if expected_extension.lower() == "csv":
-            df = pd.read_csv(StringIO(decrypted_bytes.decode("utf-8")))
+            column_type_map = entity_config.get("column_type_map", {})
+            required_column_list = list(column_type_map.keys())
+            delimiter = entity_config.get("delimiter", ",")
+            header_row_number = entity_config.get("header_row_number_to_select", 0)
+        
+            # Identify string columns for dtype enforcement
+            lst_str_cols = [col for col, dtype in column_type_map.items() if dtype == "string"]
+            dict_dtypes = {col: 'str' for col in lst_str_cols}
+            df = pd.read_csv(
+                io.StringIO(decrypted_bytes.decode("utf-8")),
+                delimiter=delimiter,
+                header=header_row_number,            # Use config header row
+                names=required_column_list if entity_config.get("force_column_names", False) else None,  # Use names only if specified
+                encoding="utf-8",
+                dtype=dict_dtypes
+            )
+            # Replace "nan" and "NaT" in string columns with empty string
+            for col in lst_str_cols:
+                df[col] = df[col].replace(['nan', 'NaT'], '')
+            
+            df = df.astype(str).replace('nan', '').replace('NaT', '')
         elif expected_extension.lower() in ("xlsx", "xls"):
             excel_engine = entity_config.get("excel_engine", "openpyxl")
             df = pd.read_excel(BytesIO(decrypted_bytes), dtype=str, engine=excel_engine)
@@ -388,20 +409,17 @@ class NRTGlueJob:
             pandas_df = self._rename_and_clean_pandas_df(pandas_df, entity_config.get("column_type_map", {}))
             spark_df = self.spark.createDataFrame(pandas_df)
 
-            landing_count = pandas_df.shape[0]
+            #landing_count = pandas_df.shape[0]
             dq_validator = DataValidator(
                 df=spark_df,
                 config=entity_config,
                 logger=self.logger,
                 file_name=audit["filename"]
             )
-            clean_df = dq_validator.run_all_checks()
-
+            clean_df, landing_count, raw_count = dq_validator.run_all_checks()
+            
             main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
-            self.logger.info(f"Row count before deduplication for {logical_file_name}: {clean_df.count()}")
-            if logical_file_name == "EGI_2_0_INC":
-                clean_df = deduplicate_egi_2_0_inc(clean_df)
-                self.logger.info(f"Row count after deduplication for {logical_file_name}: {clean_df.count()}")
+            clean_df = process_by_logical_file_name(clean_df, logical_file_name)
                 
             audit_info = dq_validator.get_audit_info()
 
@@ -416,7 +434,6 @@ class NRTGlueJob:
                 self._send_notification(result["errormessage"])
                 end_time = datetime.datetime.utcnow()
             else:
-                raw_count = clean_df.count()
                 reject_count = landing_count - raw_count
                 end_time = datetime.datetime.utcnow()
                 result.update({
@@ -442,32 +459,39 @@ class NRTGlueJob:
             }
 
     def _map_columns(self, entity_config, clean_df, audit):
-        """Apply column mapping and record hash columns."""
+        """Apply column mapping and record hash columns (if present)."""
         column_mapping = entity_config.get("column_mapping", {})
         mapped_df = apply_column_mapping_with_withColumn(clean_df, column_mapping)
         hash_columns = entity_config.get("hash_columns", [])
         hash_column_name = entity_config.get("hash_column_name", "record_hash")
         source_file_name = audit["filename"]
+    
+        # Add audit columns always
+        mapped_df = (
+            mapped_df
+            .withColumn("batch_run_dt", lit(current_timestamp()).cast(TimestampType()))
+            .withColumn("created_by", lit("glue"))
+            .withColumn("create_dt", lit(current_timestamp()).cast(TimestampType()))
+            .withColumn("source_nm", lit("sc360-dev-nrt-dataload-processor"))
+        )
+    
+        # Add hash column only if hash_columns are defined
         if hash_columns:
-            return (
-                mapped_df
-                .withColumn(hash_column_name, sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256))
-                .withColumn("source_file_name", lit(source_file_name))
-                .withColumn("batch_run_dt", lit(current_timestamp()).cast(TimestampType()))
-                .withColumn("created_by", lit("glue"))
-                .withColumn("create_dt", lit(current_timestamp()).cast(TimestampType()))
-                .withColumn("source_nm", lit("sc360-dev-nrt-dataload-processor"))
+            mapped_df = mapped_df.withColumn("source_file_name", lit(source_file_name)).withColumn(
+                hash_column_name,
+                sha2(concat_ws("|", *[col(c) for c in hash_columns]), 256)
             )
         else:
             self.logger.warning("No hash_columns defined in config; hash_code not generated.")
-            return mapped_df
+
+        return mapped_df
 
     def load_curated_to_redshift(self, entity_config, audit, final_df) -> dict:
         """Load curated data to Redshift."""
         result = {"executionstatus": "Success", "errormessage": None}
         try:
             start_time = datetime.datetime.utcnow()
-            curated_table = entity_config.get('curated_table', 'curated.CUR_REVENUE_EGI_NRT')
+            curated_table = entity_config.get('curated_table', '')
             self._execute_redshift_sql(f"TRUNCATE TABLE {curated_table};")
             secret = get_redshift_secret(self.redshift_secret_name)
             main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
@@ -510,8 +534,8 @@ class NRTGlueJob:
             load_type = entity_config.get("load_type", "scd2").lower()  # <--- READ load_type HERE
             hash_columns = entity_config.get("hash_columns", [])
             primary_keys = entity_config.get("primary_key_columns", [])
-            target_table = entity_config.get("published_table", "published.r_revenue_egi_nrt")
-            staging_table = entity_config.get("curated_table", "curated.CUR_REVENUE_EGI_NRT")
+            target_table = entity_config.get("published_table", "")
+            staging_table = entity_config.get("curated_table", "")
             
             if load_type == "scd2":
                 sql_gen = SCD2SQLGenerator(
@@ -609,6 +633,7 @@ class NRTGlueJob:
     
             # Step 2: Data Validation
             data_val_result = self.data_validation(entity_config, audit, file_val_result["decrypted_bytes"])
+            print("Curate Table", entity_config.get("curated_table", ""))
             audit.update(data_val_result)
             self.audit_log(audit, "DataValidation")
             if audit['executionstatus'] == "Failed":
