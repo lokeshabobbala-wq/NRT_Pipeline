@@ -1,0 +1,34 @@
+# Transformation from Legacy to Modern Pipeline
+
+## Slide 1: Title Slide  
+**Title:** Transformation from Legacy to Modern Pipeline  
+**Subtitle:** An Executive Overview  
+
+## Slide 2: Introduction  
+Brief overview of the transformation process.  
+
+## Slide 3: Legacy Pipeline Overview  
+Description and key components of the legacy pipeline.  
+
+## Slide 4: Modern Pipeline Overview  
+Description and key components of the modern pipeline.  
+
+## Slide 5: Modes of Operation  
+Clear differentiation between legacy and modern modes.  
+
+## Slide 6: New Features  
+- Hash Code  
+- Versioning  
+- SQS FIFO  
+- Spark Glue  
+- SCD2 (Slowly Changing Dimensions Type 2)  
+- Snapshots  
+
+## Slide 7: Architecture Flow Diagram  
+Diagram showing the architecture flow from legacy to modern.  
+
+## Slide 8: Component Comparison  
+Diagram or table comparing components of legacy vs. modern pipeline.  
+
+## Slide 9: Conclusion  
+Summary of the transformation benefits.
