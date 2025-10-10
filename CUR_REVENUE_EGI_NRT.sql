@@ -1,3 +1,10 @@
+-- curated.cur_revenue_egi_nrt definition
+
+-- Drop table
+
+-- DROP TABLE curated.cur_revenue_egi_nrt;
+
+--DROP TABLE curated.cur_revenue_egi_nrt;
 CREATE TABLE IF NOT EXISTS curated.cur_revenue_egi_nrt
 (
 	cp_backlog_sni_revenue VARCHAR(100)   ENCODE lzo
@@ -38,15 +45,13 @@ CREATE TABLE IF NOT EXISTS curated.cur_revenue_egi_nrt
 	,"sum_of_order_item_net_value_(usd)" NUMERIC(30,15)   ENCODE az64
 	,sum_of_order_item_net_value_document_currency NUMERIC(30,15)   ENCODE az64
 	,process_timestamp TIMESTAMP WITHOUT TIME ZONE   ENCODE az64
-	,sap_order_key VARCHAR(200)   ENCODE lzo
-	,region_id INTEGER   ENCODE az64
-	,fiscal_quarter VARCHAR(20)   ENCODE lzo
 	,record_hash VARCHAR(128)   ENCODE lzo
 	,source_file_name VARCHAR(512)   ENCODE lzo
 	,batch_run_dt TIMESTAMP WITHOUT TIME ZONE   ENCODE az64
 	,created_by VARCHAR(100)   ENCODE lzo
 	,create_dt TIMESTAMP WITHOUT TIME ZONE  DEFAULT ('now'::character varying)::timestamp without time zone ENCODE az64
 	,source_nm VARCHAR(100)   ENCODE lzo
+	
 )
 DISTSTYLE AUTO
  SORTKEY (
