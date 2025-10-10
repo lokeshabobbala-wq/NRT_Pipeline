@@ -107,39 +107,6 @@ def insert_glue_audit_log_rdsdata(rds_client, resourceArn, secretArn, database, 
     except Exception as e:
         print(f"Failed to insert Glue audit log via RDS Data API: {e}")
 
-def fiscal_quarter_from_date(date_val):
-    if not date_val:
-        return None
-    if isinstance(date_val, str):
-        if len(date_val) < 7:
-            return None
-        y, m = date_val[:4], int(date_val[5:7])
-    elif hasattr(date_val, "year") and hasattr(date_val, "month"):
-        y, m = str(date_val.year), date_val.month
-    else:
-        return None
-    q = ((int(m) - 1) // 3) + 1
-    return f"{y}-Q{q}"
-
-def apply_column_mapping_with_withColumn(df, mapping):
-    from pyspark.sql.functions import udf
-    from pyspark.sql.types import StringType
-
-    fiscal_quarter_udf = udf(fiscal_quarter_from_date, StringType())
-    mapped_df = df
-    for tgt, spec in mapping.items():
-        if "source" in spec:
-            mapped_df = mapped_df.withColumn(tgt, col(spec["source"]))
-        elif "lit" in spec:
-            mapped_df = mapped_df.withColumn(tgt, lit(spec["lit"]))
-        elif "concat_ws" in spec:
-            sep = spec["concat_ws"].get("sep", "")
-            cols = spec["concat_ws"]["columns"]
-            mapped_df = mapped_df.withColumn(tgt, concat_ws(sep, *[col(c) for c in cols]))
-        elif "function" in spec and spec["function"] == "fiscal_quarter_from_date":
-            mapped_df = mapped_df.withColumn(tgt, fiscal_quarter_udf(col(spec["args"][0])))
-    return mapped_df
-
 class NRTGlueJob:
     def __init__(self):
         self.args = self._parse_args()
@@ -419,7 +386,7 @@ class NRTGlueJob:
             clean_df, landing_count, raw_count = dq_validator.run_all_checks()
             
             main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
-            clean_df = process_by_logical_file_name(clean_df, logical_file_name)
+            clean_df, raw_count = process_by_logical_file_name(clean_df, logical_file_name)
                 
             audit_info = dq_validator.get_audit_info()
 
@@ -460,15 +427,13 @@ class NRTGlueJob:
 
     def _map_columns(self, entity_config, clean_df, audit):
         """Apply column mapping and record hash columns (if present)."""
-        column_mapping = entity_config.get("column_mapping", {})
-        mapped_df = apply_column_mapping_with_withColumn(clean_df, column_mapping)
         hash_columns = entity_config.get("hash_columns", [])
         hash_column_name = entity_config.get("hash_column_name", "record_hash")
         source_file_name = audit["filename"]
     
         # Add audit columns always
         mapped_df = (
-            mapped_df
+            clean_df
             .withColumn("batch_run_dt", lit(current_timestamp()).cast(TimestampType()))
             .withColumn("created_by", lit("glue"))
             .withColumn("create_dt", lit(current_timestamp()).cast(TimestampType()))
@@ -504,6 +469,7 @@ class NRTGlueJob:
                 "redshiftTmpDir": f"s3://sc360-dev-ww-nrt-bucket/staging/dt={today_date_str}/{logical_file_name}/{main_file_no_ext}/",
                 "mode": "overwrite",
             }
+            
             self._write_to_redshift(final_df, redshift_options)
             total_count = final_df.count()
             end_time = datetime.datetime.utcnow()
@@ -536,6 +502,7 @@ class NRTGlueJob:
             primary_keys = entity_config.get("primary_key_columns", [])
             target_table = entity_config.get("published_table", "")
             staging_table = entity_config.get("curated_table", "")
+            column_type_map = entity_config.get("column_type_map", {})
             
             if load_type == "scd2":
                 sql_gen = SCD2SQLGenerator(
@@ -551,7 +518,8 @@ class NRTGlueJob:
                 sql_gen = SNAPSHOTSQLGenerator(
                     target_table=target_table,
                     staging_table=staging_table,
-                    primary_key_columns=primary_keys,
+                    target_columns=list(column_type_map.keys()),
+                    source_columns=list(column_type_map.keys())
                 )
                 self._execute_redshift_sql(sql_gen.generate_update_sql())
                 self._execute_redshift_sql(sql_gen.generate_insert_sql())
