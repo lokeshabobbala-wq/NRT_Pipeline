@@ -54,22 +54,7 @@ CREATE TABLE IF NOT EXISTS intermediate.i_revenue_egi_scd2_nrt
 	,created_by VARCHAR(100)   ENCODE lzo
 	,create_dt TIMESTAMP WITHOUT TIME ZONE  DEFAULT ('now'::character varying)::timestamp without time zone ENCODE az64
 	,source_nm VARCHAR(100)   ENCODE lzo
-	,sum_of_sales_order_base_quantity_string VARCHAR(65535)   ENCODE lzo
-	,sum_of_cp_unit_quantity_string VARCHAR(65535)   ENCODE lzo
-	,sum_of_base_quantity_string VARCHAR(65535)   ENCODE lzo
-	,"sum_of_cp_gross_margin_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,"sum_of_cp_factory_margin_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,"sum_of_cp_enterprise_standard_cost_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,shipment_date_string VARCHAR(65535)   ENCODE lzo
-	,sum_of_order_item_net_value_document_currency_string VARCHAR(65535)   ENCODE lzo
-	,sum_of_net_revenue_string VARCHAR(65535)   ENCODE lzo
-	,"sum_of_cp_gross_revenue_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,secured_position_net_usd_string VARCHAR(65535)   ENCODE lzo
-	,"sum_of_order_item_net_value_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,process_timestamp_string VARCHAR(65535)   ENCODE lzo
-	,"sum_of_gross_revenue_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,"sum_of_cp_total_cost_of_sales_(usd)_string" VARCHAR(65535)   ENCODE lzo
-	,order_create_calendar_date_string VARCHAR(65535)   ENCODE lzo
+	
 )
 DISTSTYLE AUTO
  SORTKEY (
@@ -77,3 +62,5 @@ DISTSTYLE AUTO
 	)
 ;
 ALTER TABLE intermediate.i_revenue_egi_scd2_nrt owner to arubauser;
+
+TRUNCATE  published.r_revenue_egi_nrt;
