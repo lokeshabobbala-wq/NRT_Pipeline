@@ -20,11 +20,44 @@ from logging_util import Logging
 from file_validation import FileValidator
 from data_validation import DataValidator
 from sql_generator import SCD2SQLGenerator, SNAPSHOTSQLGenerator
-from custom_utility_module import process_by_logical_file_name
+from custom_processor_loader import download_custom_processor, load_processor_module, cleanup_temp_file
 
 import ast
 import datetime
 from typing import Dict, Any, Optional, Tuple
+
+def run_custom_processor_if_exists(df, logical_file_name, custom_processors_base_s3_path):
+    """
+    Attempts to run a custom processor for the given logical_file_name if the corresponding .py file exists on S3.
+    Returns processed DataFrame (or original if not found) and count.
+    """
+    import boto3
+
+    s3_client = boto3.client('s3')
+    processor_s3_path = f"{custom_processors_base_s3_path}/{logical_file_name}.py"
+
+    # Check if S3 file exists
+    bucket, key = processor_s3_path.replace("s3://", "").split("/", 1)
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        # If no exception, file exists
+    except s3_client.exceptions.NoSuchKey:
+        # No custom processor; return original
+        return df, df.count()
+    except Exception:
+        # Other error, treat as no processor
+        return df, df.count()
+
+    # Download and import the processor
+    py_file = download_custom_processor(processor_s3_path)
+    processor_module = load_processor_module(py_file, module_name=f"custom_{logical_file_name.lower()}")
+    try:
+        processed_df = processor_module.process(df)
+        processed_df = processed_df.cache()
+        count = processed_df.count()
+    finally:
+        cleanup_temp_file(py_file)
+    return processed_df, count
 
 def get_redshift_secret(secret_name, region_name="us-east-1"):
     secrets_client = boto3.client('secretsmanager', region_name=region_name)
@@ -356,6 +389,8 @@ class NRTGlueJob:
             return result
         except Exception as e:
             end_time = datetime.datetime.utcnow()
+            self.logger.error(f"Exception during file validation: {e}")
+            self.logger.error(traceback.format_exc())
             return {
                 "executionstatus": "Failed",
                 "errormessage": f"Exception during file validation: {e}",
@@ -386,7 +421,8 @@ class NRTGlueJob:
             clean_df, landing_count, raw_count = dq_validator.run_all_checks()
             
             main_file, main_file_no_ext, logical_file_name = self.extract_file_info(self.args['MAIN_KEY'])
-            clean_df, raw_count = process_by_logical_file_name(clean_df, logical_file_name)
+            custom_processors_base_s3_path = entity_config.get("custom_processors_base_s3_path", "")
+            clean_df, raw_count = run_custom_processor_if_exists(clean_df, logical_file_name, custom_processors_base_s3_path)
                 
             audit_info = dq_validator.get_audit_info()
 
@@ -417,6 +453,8 @@ class NRTGlueJob:
             return result
         except Exception as e:
             end_time = datetime.datetime.utcnow()
+            self.logger.error(f"Exception during data validation: {e}")
+            self.logger.error(traceback.format_exc())
             return {
                 "executionstatus": "Failed",
                 "errormessage": f"Exception during data validation: {e}",
@@ -482,6 +520,8 @@ class NRTGlueJob:
             return result
         except Exception as e:
             end_time = datetime.datetime.utcnow()
+            self.logger.error(f"Exception during redshift curated load: {e}")
+            self.logger.error(traceback.format_exc())
             return {
                 "executionstatus": "Failed",
                 "errormessage": f"Exception during curated Redshift load: {e}",
@@ -535,6 +575,8 @@ class NRTGlueJob:
             return result
         except Exception as e:
             end_time = datetime.datetime.utcnow()
+            self.logger.error(f"Exception during redshift published load: {e}")
+            self.logger.error(traceback.format_exc())
             return {
                 "executionstatus": "Failed",
                 "errormessage": f"Exception during published Redshift load: {e}",
